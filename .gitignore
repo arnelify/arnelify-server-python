@@ -6,16 +6,13 @@
 **/nbproject/
 **/.vscode/
 
-# Main
-build/*
-dist/*
-venv/*
-
 # Docker
 # /*.dockerfile
 # /*.yml
 
 # PIP
+build/*
+dist/*
 venv/*
 
 # Misc
