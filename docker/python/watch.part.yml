@@ -10,16 +10,3 @@
     networks:
       - arnelify-network
     tty: true
-  python_arm64:
-    container_name: python_arm64
-    build:
-      context: .
-      dockerfile: python.dockerfile
-    volumes:
-      - ./:/var/www/python
-    restart: unless-stopped
-    networks:
-      - arnelify-network
-    ports:
-      - "3001:3001"
-    tty: true

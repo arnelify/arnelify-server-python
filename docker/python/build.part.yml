@@ -6,17 +6,6 @@
       dockerfile: python.dockerfile
     volumes:
       - ./:/var/www/python
-    restart: unless-stopped
-    networks:
-      - arnelify-network
-    tty: true
-  python_arm64:
-    container_name: python_arm64
-    build:
-      context: .
-      dockerfile: python.dockerfile
-    volumes:
-      - ./:/var/www/python
     healthcheck:
       start_period: 10s
       test: ["CMD", "curl", "-f", "http://localhost:3001"]
