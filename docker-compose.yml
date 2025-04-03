@@ -15,4 +15,6 @@ services:
     restart: unless-stopped
     networks:
       - arnelify-network
+    ports:
+      - "3001:3001"
     tty: true

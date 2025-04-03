@@ -3,24 +3,24 @@ import json
 class Res:
 
   def __init__(self):
-    def callback(message: str, isError: bool) -> None:
+    def logger(message: str, isError: bool) -> None:
       if isError:
         print("Error: " + message)
         return
       print(message)
 
-    self.callback: callable = callback
+    self.logger: callable = logger
     self.res: dict = {
       "body": "",
       "code": 200,
       "filePath": "",
-      "isStatic": False,
-      "headers": {}
+      "headers": {},
+      "isStatic": False
     }
-    
+
   def addBody(self, chunk: str) -> None:
     if len(self.res["filePath"]):
-      self.callback("Can't add body to a Response that contains a file.", True)
+      self.logger("Can't add body to a Response that contains a file.", True)
       exit(1)
 
     self.res["body"] += chunk
@@ -30,7 +30,7 @@ class Res:
 
   def setFile(self, filePath: str, isStatic: bool = False) -> None:
     if len(self.res["body"]):
-      self.callback("Can't add an attachment to a Response that contains a body.", True)
+      self.logger("Can't add an attachment to a Response that contains a body.", True)
       exit(1)
 
     self.res["filePath"] = filePath  
@@ -38,7 +38,7 @@ class Res:
 
   def setHeader(self, key: str, value: str) -> None:
     self.res["headers"][key] = value
-  
+
   def end(self) -> None:
     if len(self.res["filePath"]):
       self.res["body"] = ""
@@ -48,9 +48,6 @@ class Res:
       self.res["filePath"] = ""
       self.res["isStatic"] = False
       return
-    
-    self.callback("Add the body or set the file.", True)
-    exit(1)
 
   def serialize(self) -> str:
     return json.dumps(self.res, separators=(',', ':'))

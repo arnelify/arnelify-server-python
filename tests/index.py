@@ -1,28 +1,8 @@
 from arnelify_server import ArnelifyServer
 from arnelify_server.contracts.res import Res
-from os import path
-import platform
 import json
 
 def main():
-
-  # Compile the dynamic libraries as described here:
-  # https://github.com/arnelify/arnelify-server-python
-
-  # libPath: str = ""
-  # if platform.architecture()[0] != '64bit':
-  #   print("CPU platform isn't 64bit.")
-  #   exit(1)
-    
-  # if platform.machine() == 'aarch64':
-  #   libPath = path.abspath('arnelify_server/bin/arnelify_server_arm64.so')
-
-  # elif platform.machine() == 'x86_64':
-  #   libPath = path.abspath('arnelify_server/bin/arnelify_server_amd64.so')
-  
-  # else:
-  #   print("CPU platform isn't supported.")
-  #   exit(1)
 
   server = ArnelifyServer({
       "SERVER_ALLOW_EMPTY_FILES": True,

@@ -11,7 +11,7 @@ ffi = Extension(
 
 setup(
     name="arnelify-server",
-    version="0.7.1",
+    version="0.7.2",
     author="Arnelify",
     description="Minimalistic dynamic library which is a powerful http-server written in C and C++.",
     url='https://github.com/arnelify/arnelify-server-python',
@@ -22,8 +22,7 @@ setup(
     long_description=open("README.md", "r", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     classifiers=[
-        "Programming Language :: Python :: 3",
-        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3"
     ],
     ext_modules=[ffi],
 )
