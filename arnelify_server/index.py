@@ -1,6 +1,7 @@
 import cffi
 import json
 import os
+import threading
 
 from .contracts.res import Res
 
@@ -84,7 +85,17 @@ class ArnelifyServer:
       callback(message, False)
     
     cCallback = self.ffi.callback("const void (const char*, const int)", callbackWrapper)
-    self.lib.server_start(cCallback)
+    def server_thread():
+        self.lib.server_start(cCallback)
+
+    thread = threading.Thread(target=server_thread)
+    thread.daemon = True  # Allows the thread to exit when the program exits
+    thread.start()
+    
+    try:
+      thread.join()  # This will block and keep the program running until the background thread finishes
+    except KeyboardInterrupt:
+      exit(1)
   
   def stop(self) -> None:
     self.lib.server_stop()
