@@ -10,7 +10,7 @@ ffi = Extension(
 )
 
 setup(
-    name="arnelify-server",
+    name="arnelify_server",
     version="0.7.4",
     author="Arnelify",
     description="Minimalistic dynamic library which is a powerful http-server written in C and C++.",
