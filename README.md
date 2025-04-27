@@ -1,9 +1,9 @@
 <img src="https://static.wikia.nocookie.net/arnelify/images/c/c8/Arnelify-logo-2024.png/revision/latest?cb=20240701012515" style="width:336px;" alt="Arnelify Logo" />
 
-![Arnelify Server for Python](https://img.shields.io/badge/Arnelify%20Server%20for%20Python-0.7.4-yellow) ![C++](https://img.shields.io/badge/C++-2b-red) ![G++](https://img.shields.io/badge/G++-14.2.0-blue) ![Python](https://img.shields.io/badge/Python-3.11.2-blue) ![Nuitka](https://img.shields.io/badge/Nuitka-2.6.4-blue)
+![Arnelify Server for Python](https://img.shields.io/badge/Arnelify%20Server%20for%20Python-0.7.5-yellow) ![C++](https://img.shields.io/badge/C++-2b-red) ![G++](https://img.shields.io/badge/G++-14.2.0-blue) ![Python](https://img.shields.io/badge/Python-3.11.2-blue) ![Nuitka](https://img.shields.io/badge/Nuitka-2.6.4-blue)
 
 ## 🚀 About
-**Arnelify® Server for Python** - is a minimalistic dynamic library which is a powerful http-server written in C and C++.
+**Arnelify® Server for Python** - is a minimalistic dynamic library which is a powerful server written in C and C++.
 
 ## 📋 Minimal Requirements
 > Important: It's strongly recommended to use in a container that has been built from the gcc v14.2.0 image.
@@ -73,15 +73,15 @@ This software is licensed under the <a href="https://github.com/arnelify/arnelif
 Join us to help improve this software, fix bugs or implement new functionality. Active participation will help keep the software up-to-date, reliable, and aligned with the needs of its users.
 
 ## ⭐ Release Notes
-Version 0.7.4 - Minimalistic dynamic library
+Version 0.7.5 - Minimalistic dynamic library
 
 We are excited to introduce the Arnelify Server dynamic library for Python! Please note that this version is raw and still in active development.
 
 Change log:
 
-* Multi-Threading
 * Minimalistic dynamic library for Python
 * Block processing in "on-the-fly" mode
+* Multi-Threading
 * GZIP support
 * Significant refactoring and optimizations
 

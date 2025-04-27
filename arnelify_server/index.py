@@ -3,9 +3,9 @@ import json
 import os
 import threading
 
-from .contracts.res import Res
+from .contracts.res import Http1Res
 
-class ArnelifyServer:
+class Http1:
   def __init__(self, opts: dict):
     srcDir: str = os.walk(os.path.abspath('venv/lib64'))
     libPaths: list[str] = []
@@ -44,11 +44,11 @@ class ArnelifyServer:
       typedef const char* (*cHandler)(const char*);
       typedef const void (*cCallback)(const char*, const int);
 
-      void server_create(opts);
-      void server_destroy();
-      void server_set_handler(cHandler cHandler, int hasRemove);
-      void server_start(cCallback cCallback);
-      void server_stop();
+      void server_http1_create(opts);
+      void server_http1_destroy();
+      void server_http1_set_handler(cHandler cHandler, int hasRemove);
+      void server_http1_start(cCallback cCallback);
+      void server_http1_stop();
     """)
 
   def setHandler(self, handler: callable) -> None:
@@ -56,7 +56,7 @@ class ArnelifyServer:
     
   def start(self, callback: callable) -> None:
     cOpts = self.ffi.new("char[]", self.opts.encode('utf-8'))
-    self.lib.server_create(cOpts)
+    self.lib.server_http1_create(cOpts)
 
     if hasattr(self, 'handler'):
       def handlerWrapper(cSerialized):
@@ -68,14 +68,14 @@ class ArnelifyServer:
           print("[Arnelify Server FFI]: Python error: The Request must be a valid JSON.")
           exit(1)
         req: dict = json.loads(serialized)
-        res: Res = Res()
+        res: Http1Res = Http1Res()
 
         self.handler(req, res)
         serialized: str = res.serialize()
         return self.ffi.new("char[]", serialized.encode('utf-8'))
 
       self.cHandler = self.ffi.callback("const char* (const char*)", handlerWrapper)
-      self.lib.server_set_handler(self.cHandler, 0)
+      self.lib.server_http1_set_handler(self.cHandler, 0)
 
     def callbackWrapper(cMessage, isError):
       message: str = self.ffi.string(cMessage).decode('utf-8')
@@ -86,7 +86,7 @@ class ArnelifyServer:
     
     cCallback = self.ffi.callback("const void (const char*, const int)", callbackWrapper)
     def server_thread():
-        self.lib.server_start(cCallback)
+        self.lib.server_http1_start(cCallback)
 
     thread = threading.Thread(target=server_thread)
     thread.daemon = True  # Allows the thread to exit when the program exits
@@ -98,4 +98,4 @@ class ArnelifyServer:
       exit(1)
   
   def stop(self) -> None:
-    self.lib.server_stop()
+    self.lib.server_http1_stop()

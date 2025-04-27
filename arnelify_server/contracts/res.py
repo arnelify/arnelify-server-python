@@ -1,6 +1,6 @@
 import json
 
-class Res:
+class Http1Res:
 
   def __init__(self):
     def logger(message: str, isError: bool) -> None:

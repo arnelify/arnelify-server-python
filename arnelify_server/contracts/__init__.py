@@ -1,1 +1,1 @@
-from .res import Res
+from .res import Http1Res
