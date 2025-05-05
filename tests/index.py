@@ -21,19 +21,20 @@ def main():
     "SERVER_UPLOAD_DIR": "storage/upload"
   })
 
-  def handler(req: dict, res: Http1Res):
+  def handlerCallback(req: dict, res: Http1Res):
     res.setCode(200)
     res.addBody(json.dumps(req, separators=(',', ':')))
     res.end()
 
-  http1.setHandler(handler)
+  http1.handler(handlerCallback)
 
-  def callback(message: str, isError: bool):
+  def startCallback(message: str, isError: bool):
     if isError:
       print("[Arnelify Server]: Error: " + message)
+      return
     print("[Arnelify Server]: " + message)
 
-  http1.start(callback)
+  http1.start(startCallback)
 
 if __name__ == "__main__":
     main()

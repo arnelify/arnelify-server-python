@@ -46,43 +46,42 @@ class Http1:
 
       void server_http1_create(opts);
       void server_http1_destroy();
-      void server_http1_set_handler(cHandler cHandler, int hasRemove);
+      void server_http1_handler(cHandler cHandler);
       void server_http1_start(cCallback cCallback);
       void server_http1_stop();
     """)
 
-  def setHandler(self, handler: callable) -> None:
-    self.handler = handler
+  def handler(self, cb: callable) -> None:
+    self.callback = cb
     
-  def start(self, callback: callable) -> None:
+  def start(self, cb: callable) -> None:
     cOpts = self.ffi.new("char[]", self.opts.encode('utf-8'))
     self.lib.server_http1_create(cOpts)
 
-    if hasattr(self, 'handler'):
+    if hasattr(self, 'callback'):
       def handlerWrapper(cSerialized):
         serialized: str = self.ffi.string(cSerialized).decode('utf-8')
-        
         try: 
           json.loads(serialized)
         except json.JSONDecodeError as err:
           print("[Arnelify Server FFI]: Python error: The Request must be a valid JSON.")
           exit(1)
+
         req: dict = json.loads(serialized)
         res: Http1Res = Http1Res()
-
-        self.handler(req, res)
+        self.callback(req, res)
         serialized: str = res.serialize()
         return self.ffi.new("char[]", serialized.encode('utf-8'))
 
       self.cHandler = self.ffi.callback("const char* (const char*)", handlerWrapper)
-      self.lib.server_http1_set_handler(self.cHandler, 0)
+      self.lib.server_http1_handler(self.cHandler)
 
     def callbackWrapper(cMessage, isError):
       message: str = self.ffi.string(cMessage).decode('utf-8')
       if isError:
-        callback(message, True)
+        cb(message, True)
         return
-      callback(message, False)
+      cb(message, False)
     
     cCallback = self.ffi.callback("const void (const char*, const int)", callbackWrapper)
     def server_thread():
