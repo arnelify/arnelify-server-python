@@ -28,6 +28,7 @@ class Http1:
       "SERVER_MAX_FILES",
       "SERVER_MAX_FILES_SIZE_TOTAL_MB",
       "SERVER_MAX_FILE_SIZE_MB",
+      "SERVER_NET_CHECK_FREQ_MS",
       "SERVER_PORT",
       "SERVER_QUEUE_LIMIT"
     ]
@@ -88,11 +89,11 @@ class Http1:
         self.lib.server_http1_start(cCallback)
 
     thread = threading.Thread(target=server_thread)
-    thread.daemon = True  # Allows the thread to exit when the program exits
+    thread.daemon = True
     thread.start()
     
     try:
-      thread.join()  # This will block and keep the program running until the background thread finishes
+      thread.join()
     except KeyboardInterrupt:
       exit(1)
   

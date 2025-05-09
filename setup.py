@@ -11,7 +11,7 @@ ffi = Extension(
 
 setup(
   name="arnelify_server",
-  version="0.7.7",
+  version="0.7.8",
   author="Arnelify",
   description="Minimalistic dynamic library which is a powerful server written in C and C++.",
   url='https://github.com/arnelify/arnelify-server-python',
