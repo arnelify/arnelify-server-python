@@ -1,3 +1,17 @@
 [build-system]
-requires = ["cffi", "setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.11,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "arnelify_server"
+authors = [{ name = "Arnelify" }]
+description = "Minimalistic dynamic library which is a powerful server written in C and C++."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "License :: OSI Approved :: MIT License",
+]
+dynamic = ["version"]

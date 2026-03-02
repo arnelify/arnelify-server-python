@@ -1,5 +1,4 @@
-cffi
-nuitka
-setuptools
-wheel
-twine
+patchelf==0.17.2
+maturin==1.11.5
+nuitka==2.8.9
+twine==6.2.0

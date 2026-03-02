@@ -1,24 +1,13 @@
 # Boot Makefile
 # See https://www.gnu.org/software/make/manual/make.html for more about make.
 
-# ENGINE
-ENGINE = g++
-ENGINE_FLAGS = -std=c++2b
-
 # PATH
 PATH_BIN = $(CURDIR)/tests/bin/index.bin
-PATH_SRC = $(CURDIR)/tests/index.py
-
-# INC
-INC_CPP = -I $(CURDIR)/src/src
-INC_INCLUDE = -L /usr/include
-INC_JSONCPP = -I /usr/include/jsoncpp/json
-INC = ${INC_CPP} ${INC_INCLUDE} ${INC_JSONCPP}
-
-# LINK
-LINK_JSONCPP = -ljsoncpp
-LINK_ZLIB = -lz
-LINK = ${LINK_JSONCPP} ${LINK_ZLIB}
+PATH_SRC_HTTP1 = $(CURDIR)/tests/tcp1/http1.py
+PATH_SRC_WS = $(CURDIR)/tests/tcp1/ws.py
+PATH_SRC_HTTP2 = $(CURDIR)/tests/tcp2/http2.py
+PATH_SRC_HTTP3 = $(CURDIR)/tests/tcp2/http3.py
+PATH_SRC_WT = $(CURDIR)/tests/tcp2/wt.py
 
 # PYTHON
 PYTHON = venv/bin/python
@@ -29,25 +18,72 @@ PYPI = venv/bin/pip
 NUITKA = venv/bin/nuitka
 NUITKA_FLAGS = --standalone --onefile
 
-# SCRIPTS
 install:
 	clear && find . -type d -name '__pycache__' -exec rm -r {} +
-	rm -rf build && rm -rf dist && rm -rf venv
+	rm -rf venv
 	python ${PYTHON_FLAGS} venv venv
 	${PYPI} install -r requirements.txt
 
 build:
-	clear && rm -rf build/* && rm -rf dist/*
-	${PYTHON} setup.py sdist bdist_wheel --plat-name=manylinux2014_x86_64
-	${PYTHON} ${PYTHON_FLAGS} index
+	clear && rm -rf target/* && rm -rf arnelify_server/*.so
+	maturin develop
+	maturin build --release
 
-test:
+test_http1:
 	clear && mkdir -p tests/bin && rm -rf tests/bin/*
-	${PYTHON} ${PYTHON_FLAGS} tests.index
+	${PYTHON} ${PYTHON_FLAGS} tests.tcp1.http1
 
-test_nuitka:
+test_http2:
 	clear && mkdir -p tests/bin && rm -rf tests/bin/*
-	${NUITKA} ${NUITKA_FLAGS} --output-dir=tests/bin ${PATH_SRC} && clear
+	${PYTHON} ${PYTHON_FLAGS} tests.tcp1.http2
+
+test_ws:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${PYTHON} ${PYTHON_FLAGS} tests.tcp1.ws
+
+test_http3:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${PYTHON} ${PYTHON_FLAGS} tests.tcp2.http3
+
+test_wt:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${PYTHON} ${PYTHON_FLAGS} tests.tcp2.wt
+
+nuitka_http1:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${NUITKA} ${NUITKA_FLAGS} --output-dir=tests/bin ${PATH_SRC_HTTP1} && clear
 	${PATH_BIN}
 
-.PHONY: build test
+nuitka_ws:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${NUITKA} ${NUITKA_FLAGS} --output-dir=tests/bin ${PATH_SRC_WS} && clear
+	${PATH_BIN}
+
+nuitka_http2:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${NUITKA} ${NUITKA_FLAGS} --output-dir=tests/bin ${PATH_SRC_HTTP2} && clear
+	${PATH_BIN}
+
+nuitka_http3:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${NUITKA} ${NUITKA_FLAGS} --output-dir=tests/bin ${PATH_SRC_HTTP3} && clear
+	${PATH_BIN}
+
+nuitka_wt:
+	clear && mkdir -p tests/bin && rm -rf tests/bin/*
+	${NUITKA} ${NUITKA_FLAGS} --output-dir=tests/bin ${PATH_SRC_WT} && clear
+	${PATH_BIN}
+
+.PHONY: \
+  install \
+  build \
+  test_http1 \
+  test_ws \
+  test_http2 \
+  test_http3 \
+  test_wt \
+  nuitka_http1 \
+  nuitka_ws \
+  nuitka_http2 \
+  nuitka_http3 \
+  nuitka_wt

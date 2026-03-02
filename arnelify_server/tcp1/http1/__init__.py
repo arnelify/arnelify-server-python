@@ -20,8 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from .tcp1 import Http1, Http1Ctx, Http1Opts, Http1Stream
-from .tcp1 import Http2, Http2Ctx, Http2Opts, Http2Stream
-from .tcp1 import WebSocket, WebSocketBytes, WebSocketCtx, WebSocketOpts, WebSocketStream
-from .tcp2 import Http3, Http3Ctx, Http3Opts, Http3Stream
-from .tcp2 import WebTransport, WebTransportBytes, WebTransportCtx, WebTransportOpts, WebTransportStream
+from .main import Http1
+from .main import Http1Ctx
+from .main import Http1Opts
+from .main import Http1Stream
