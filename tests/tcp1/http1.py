@@ -3,33 +3,40 @@ from arnelify_server import Http1Ctx
 from arnelify_server import Http1Opts
 from arnelify_server import Http1Stream
 
-http1_opts: Http1Opts = {
-    "allow_empty_files": False,
+import asyncio
+from typing import Awaitable
+
+async def main() -> Awaitable[None]:
+
+  http1_opts: Http1Opts = {
+    "allow_empty_files": True,
     "block_size_kb": 64,
     "charset": "utf-8",
     "compression": True,
     "keep_alive": 30,
     "keep_extensions": True,
-    "max_fields": 10,
+    "max_fields": 60,
     "max_fields_size_total_mb": 1,
-    "max_files": 10,
-    "max_files_size_total_mb": 10,
-    "max_file_size_mb": 10,
+    "max_files": 3,
+    "max_files_size_total_mb": 60,
+    "max_file_size_mb": 60,
     "port": 4433,
     "storage_path": "/var/www/cpp/storage",
     "thread_limit": 4,
-}
+  }
 
-http1 = Http1(http1_opts)
-def http1_logger(_level: str, message: str):
-  print("[Arnelify Server]: " + message)
+  http1: Http1 = Http1(http1_opts)
+  async def http1_logger(_level: str, message: str) -> Awaitable[None]:
+    print("[Arnelify Server]: " + message)
 
-http1.logger(http1_logger)
+  http1.logger(http1_logger)
+  async def http1_handler(ctx: Http1Ctx, stream: Http1Stream) -> Awaitable[None]:
+    await stream.set_code(200)
+    await stream.push_json(ctx)
+    await stream.end()
 
-def http1_handler(ctx: Http1Ctx, stream: Http1Stream):
-  stream.set_code(200)
-  stream.push_json(ctx)
-  stream.end()
-
-http1.on("/", http1_handler)
-http1.start()
+  http1.on("/", http1_handler)
+  await http1.start()
+  
+if __name__ == "__main__":
+    asyncio.run(main())

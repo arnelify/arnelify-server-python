@@ -22,13 +22,18 @@
 
 use pyo3::prelude::*;
 
-pub mod tcp1;
-pub mod tcp2;
+mod ipc;
+mod tcp1;
+mod tcp2;
 
 #[pymodule]
 mod arnelify_server {
   use pyo3::prelude::*;
-  use pyo3::types::PyBytes;
+
+  use crate::ipc::{
+    UnixDomainSocket, UnixDomainSocketBytes, UnixDomainSocketCtx, UnixDomainSocketHandler,
+    UnixDomainSocketOpts,
+  };
 
   use crate::tcp1::{Http1, Http1Ctx, Http1Handler, Http1Logger, Http1Opts, Http1Stream};
   use crate::tcp1::{Http2, Http2Ctx, Http2Handler, Http2Logger, Http2Opts, Http2Stream};
@@ -49,41 +54,49 @@ mod arnelify_server {
     sync::{
       Arc, Mutex, MutexGuard, OnceLock,
       atomic::{AtomicUsize, Ordering},
+      mpsc,
+      mpsc::RecvTimeoutError,
     },
+    thread,
+    time::Duration,
   };
 
   use serde_json::Value as JSON;
 
-  type Http1Streams = HashMap<usize, Arc<Mutex<Http1Stream>>>;
-  type Http2Streams = HashMap<usize, Arc<Mutex<Http2Stream>>>;
-  type WebSocketStreams = HashMap<usize, Arc<Mutex<WebSocketStream>>>;
-  type Http3Streams = HashMap<usize, Arc<Mutex<Http3Stream>>>;
-  type WebTransportStreams = HashMap<usize, Arc<Mutex<WebTransportStream>>>;
-
+  type Http1Streams = HashMap<usize, (Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)>;
   static HTTP1_MAP: OnceLock<Mutex<HashMap<usize, Arc<Http1>>>> = OnceLock::new();
   static HTTP1_ID: OnceLock<Mutex<usize>> = OnceLock::new();
   static HTTP1_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
   static HTTP1_STREAMS: OnceLock<Mutex<Http1Streams>> = OnceLock::new();
+  static HTTP1_UDS_MAP: OnceLock<Mutex<HashMap<usize, Arc<UnixDomainSocket>>>> = OnceLock::new();
 
+  type Http2Streams = HashMap<usize, (Arc<Mutex<Http2Stream>>, mpsc::Sender<u8>)>;
   static HTTP2_MAP: OnceLock<Mutex<HashMap<usize, Arc<Http2>>>> = OnceLock::new();
   static HTTP2_ID: OnceLock<Mutex<usize>> = OnceLock::new();
   static HTTP2_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
   static HTTP2_STREAMS: OnceLock<Mutex<Http2Streams>> = OnceLock::new();
+  static HTTP2_UDS_MAP: OnceLock<Mutex<HashMap<usize, Arc<UnixDomainSocket>>>> = OnceLock::new();
 
+  type WebSocketStreams = HashMap<usize, (Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)>;
   static WS_MAP: OnceLock<Mutex<HashMap<usize, Arc<WebSocket>>>> = OnceLock::new();
   static WS_ID: OnceLock<Mutex<usize>> = OnceLock::new();
   static WS_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
   static WS_STREAMS: OnceLock<Mutex<WebSocketStreams>> = OnceLock::new();
+  static WS_UDS_MAP: OnceLock<Mutex<HashMap<usize, Arc<UnixDomainSocket>>>> = OnceLock::new();
 
+  type Http3Streams = HashMap<usize, (Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)>;
   static HTTP3_MAP: OnceLock<Mutex<HashMap<usize, Arc<Http3>>>> = OnceLock::new();
   static HTTP3_ID: OnceLock<Mutex<usize>> = OnceLock::new();
   static HTTP3_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
   static HTTP3_STREAMS: OnceLock<Mutex<Http3Streams>> = OnceLock::new();
+  static HTTP3_UDS_MAP: OnceLock<Mutex<HashMap<usize, Arc<UnixDomainSocket>>>> = OnceLock::new();
 
+  type WebTransportStreams = HashMap<usize, (Arc<Mutex<WebTransportStream>>, mpsc::Sender<u8>)>;
   static WT_MAP: OnceLock<Mutex<HashMap<usize, Arc<WebTransport>>>> = OnceLock::new();
   static WT_ID: OnceLock<Mutex<usize>> = OnceLock::new();
   static WT_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
   static WT_STREAMS: OnceLock<Mutex<WebTransportStreams>> = OnceLock::new();
+  static WT_UDS_MAP: OnceLock<Mutex<HashMap<usize, Arc<UnixDomainSocket>>>> = OnceLock::new();
 
   fn get_str(opts: &JSON, key: &str) -> String {
     opts
@@ -143,30 +156,14 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn http1_add_header(py_stream_id: usize, py_key: &str, py_value: &str) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          stream_lock.add_header(py_key, py_value);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_add_header: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
   fn http1_create(py_opts: &str) -> PyResult<usize> {
     let opts: JSON = {
       match serde_json::from_str(py_opts) {
         Ok(json) => json,
         Err(_) => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_create: Invalid JSON in 'py_opts'.");
+          println!(
+            "[Arnelify Server]: Rust PYO3 error in http1_create: Invalid JSON in 'py_opts'."
+          );
           return Ok(0);
         }
       }
@@ -178,6 +175,380 @@ mod arnelify_server {
       *py += 1;
       *py
     };
+
+    let uds_opts: UnixDomainSocketOpts = UnixDomainSocketOpts {
+      block_size_kb: get_usize(&opts, "block_size_kb"),
+      socket_path: get_str(&opts, "socket_path"),
+      thread_limit: get_u64(&opts, "thread_limit"),
+    };
+
+    let uds_http1_add_header: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let key: String = v[1].as_str().unwrap_or("").to_string();
+            let value: String = v[2].as_str().unwrap_or("").to_string();
+
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  stream_lock.add_header(&key, &value);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http1_add_header: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http1_end: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  stream_lock.end();
+                  let _ = tx.send(1);
+                }
+                None => {
+                  let args: JSON =
+                    serde_json::json!(["error", "PYO3 error in uds_http1_end: No stream found."]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http1_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let is_attachment: bool = v[1].as_u64().unwrap_or(0) != 0;
+            let bytes: Vec<u8> = bytes.lock().unwrap().clone();
+
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_bytes(&bytes, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http1_push_bytes: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http1_push_file: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let file_path: &str = v[1].as_str().unwrap_or("");
+            let is_attachment: bool = v[2].as_u64().unwrap_or(0) != 0;
+
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_file(&file_path, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http1_push_file: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http1_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let json: JSON = v[1].clone();
+            let is_attachment: bool = v[2].as_u64().unwrap_or(0) != 0;
+
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_json(&json, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http1_push_json: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http1_set_code: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let code: u64 = v[1].as_u64().unwrap_or(0);
+
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  stream_lock.set_code(code as u16);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http1_set_code: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http1_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let compression: &str = v[1].as_str().unwrap_or("");
+
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  if compression.len() > 0 {
+                    stream_lock.set_compression(Some(String::from(compression)));
+                    return;
+                  }
+
+                  stream_lock.set_compression(None);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http1_set_compression: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http1_set_headers: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let mut headers: Vec<(String, String)> = Vec::new();
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            if let Some(JSON::Object(map)) = v.get(1) {
+              for (key, value) in map {
+                let value = match value {
+                  JSON::String(s) => s.clone(),
+                  JSON::Number(n) => n.to_string(),
+                  JSON::Bool(b) => b.to_string(),
+                  _ => continue,
+                };
+
+                headers.push((key.clone(), value));
+              }
+            }
+
+            if let Some(map) = HTTP1_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http1Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http1Stream> = stream_arc.lock().unwrap();
+                  stream_lock.set_headers(headers);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http1_set_headers: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP1_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http1_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    uds.on("http1_add_header", uds_http1_add_header);
+    uds.on("http1_end", uds_http1_end);
+    uds.on("http1_push_bytes", uds_http1_push_bytes);
+    uds.on("http1_push_file", uds_http1_push_file);
+    uds.on("http1_push_json", uds_http1_push_json);
+    uds.on("http1_set_code", uds_http1_set_code);
+    uds.on("http1_set_compression", uds_http1_set_compression);
+    uds.on("http1_set_headers", uds_http1_set_headers);
+
+    let uds_map: &Mutex<HashMap<usize, Arc<UnixDomainSocket>>> =
+      HTTP1_UDS_MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+      uds_map.lock().unwrap().insert(new_id, Arc::new(uds));
+    }
 
     let http1_opts: Http1Opts = Http1Opts {
       allow_empty_files: get_bool(&opts, "allow_empty_files"),
@@ -212,35 +583,24 @@ mod arnelify_server {
       map.lock().unwrap().remove(&py_id);
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http1_end(py_stream_id: usize) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          stream_lock.end();
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_end: No stream found.");
-        }
-      }
+    if let Some(map) = HTTP1_UDS_MAP.get() {
+      map.lock().unwrap().remove(&py_id);
     }
 
     Ok(())
   }
 
   #[pyfunction]
-  fn http1_logger(py_id: usize, py_cb: Py<PyAny>) -> PyResult<()> {
-    let http1_logger: Arc<Http1Logger> = Arc::new(move |level: &str, message: &str| {
-      Python::attach(|py| {
-        if let Err(err) = py_cb.call1(py, (level, message)) {
-          err.print(py);
+  fn http1_logger(py_id: usize) -> PyResult<()> {
+    let http1_logger: Arc<Http1Logger> = Arc::new(move |level: &str, message: &str| -> () {
+      let args: JSON = serde_json::json!([level, message]);
+      let bytes: UnixDomainSocketBytes = Vec::new();
+
+      if let Some(map) = HTTP1_UDS_MAP.get() {
+        if let Some(uds) = map.lock().unwrap().get(&py_id) {
+          uds.push("http1_logger", &args, bytes, true);
         }
-      });
+      }
     });
 
     if let Some(map) = HTTP1_MAP.get() {
@@ -253,27 +613,62 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn http1_on(py_id: usize, py_path: &str, py_cb: Py<PyAny>) -> PyResult<()> {
+  fn http1_on(py_id: usize, py_path: &str) -> PyResult<()> {
+    let path_safe: String = String::from(py_path);
+
     let http1_handler: Arc<Http1Handler> = Arc::new(
-      move |ctx: Arc<Mutex<Http1Ctx>>, stream: Arc<Mutex<Http1Stream>>| {
+      move |ctx: Arc<Mutex<Http1Ctx>>, stream: Arc<Mutex<Http1Stream>>| -> () {
+        let (tx, rx) = mpsc::channel::<u8>();
         let stream_id: usize = HTTP1_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
         HTTP1_STREAMS
           .get_or_init(|| Mutex::new(HashMap::new()))
           .lock()
           .unwrap()
-          .insert(stream_id, stream);
+          .insert(stream_id, (stream, tx));
 
-        let json: String = {
-          let ctx_lock = ctx.lock().unwrap();
-          serde_json::to_string(&*ctx_lock).unwrap()
-        };
+        let ctx: Http1Ctx = ctx.lock().unwrap().clone();
+        let args: JSON = serde_json::json!([stream_id, path_safe, ctx]);
+        let bytes: UnixDomainSocketBytes = Vec::new();
 
-        Python::attach(|py| {
-          if let Err(err) = py_cb.call1(py, (stream_id, json)) {
-            err.print(py);
+        if let Some(map) = HTTP1_UDS_MAP.get() {
+          if let Some(uds) = map.lock().unwrap().get(&py_id) {
+            uds.push("http1_on", &args, bytes, true);
           }
-        });
+        }
+
+        loop {
+          match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(val) => {
+              if val == 1 {
+                break;
+              }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+              let args: JSON =
+                serde_json::json!(["error", "PYO3 error in http1_on: Stream response timeout."]);
+              if let Some(map) = HTTP1_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("http1_logger", &args, Vec::new(), true);
+                }
+              }
+              break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+              let args: JSON = serde_json::json!([
+                "error",
+                "PYO3 error in http1_on: Stream channel disconnected."
+              ]);
+              if let Some(map) = HTTP1_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("http1_logger", &args, Vec::new(), true);
+                }
+              }
+
+              break;
+            }
+          }
+        }
 
         if let Some(map) = HTTP1_STREAMS.get() {
           map.lock().unwrap().remove(&stream_id);
@@ -291,165 +686,25 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn http1_push_bytes(
-    py_stream_id: usize,
-    py_bytes: &[u8],
-    py_is_attachment: usize,
-  ) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          if py_bytes.is_empty() {
-            let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-            stream_lock.push_bytes(&[], is_attachment);
-            return Ok(());
-          }
+  fn http1_start_ipc(py_id: usize) -> PyResult<()> {
+    let (tx, rx) = mpsc::channel::<u8>();
 
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          stream_lock.push_bytes(py_bytes, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_push_bytes: No stream found.");
-        }
+    if let Some(map) = HTTP1_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        let uds_safe: Arc<UnixDomainSocket> = Arc::clone(uds);
+        thread::spawn(move || {
+          uds_safe.start(Arc::new(move || {
+            let _ = tx.send(1);
+          }));
+        });
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http1_push_file(
-    py_stream_id: usize,
-    py_file_path: &str,
-    py_is_attachment: usize,
-  ) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          stream_lock.push_file(py_file_path, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_push_file: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http1_push_json(py_stream_id: usize, py_json: &str, py_is_attachment: usize) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          let json: JSON = match serde_json::from_str(py_json) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in http1_push_json: Invalid JSON in 'py_json'."
-              );
-
-              return Ok(());
-            }
-          };
-
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          stream_lock.push_json(&json, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_push_json: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http1_set_code(py_stream_id: usize, py_code: usize) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          stream_lock.set_code(py_code as u16);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_set_code: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http1_set_compression(py_stream_id: usize, py_compression: &str) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          if py_compression.len() > 0 {
-            stream_lock.set_compression(Some(String::from(py_compression)));
-            return Ok(());
-          }
-
-          stream_lock.set_compression(None);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_set_compression: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http1_set_headers(py_stream_id: usize, py_headers: &str) -> PyResult<()> {
-    if let Some(map) = HTTP1_STREAMS.get() {
-      let streams: MutexGuard<'_, Http1Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let json: Vec<JSON> = match serde_json::from_str(py_headers) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in http1_set_headers: Invalid JSON in 'py_headers'."
-              );
-              return Ok(());
-            }
-          };
-
-          let mut headers: Vec<(String, String)> = Vec::new();
-          for header in json {
-            if let JSON::Object(pair) = header {
-              for (key, value) in pair {
-                let value = match value {
-                  JSON::String(s) => s,
-                  JSON::Number(n) => n.to_string(),
-                  JSON::Bool(b) => b.to_string(),
-                  _ => continue,
-                };
-                headers.push((key, value));
-              }
-            }
-          }
-
-          let mut stream_lock: std::sync::MutexGuard<'_, Http1Stream> = stream.lock().unwrap();
-          stream_lock.set_headers(headers);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http1_set_headers: No stream found.");
-        }
+    loop {
+      match rx.recv() {
+        Ok(1) => break,
+        Ok(_) => continue,
+        Err(_) => break,
       }
     }
 
@@ -460,9 +715,9 @@ mod arnelify_server {
   fn http1_start(py_id: usize) -> PyResult<()> {
     if let Some(map) = HTTP1_MAP.get() {
       if let Some(http1) = map.lock().unwrap().get(&py_id) {
-        let http1 = http1.clone();
-        std::thread::spawn(move || {
-          http1.start();
+        let http1_safe: Arc<Http1> = Arc::clone(http1);
+        thread::spawn(move || {
+          http1_safe.start();
         });
       }
     }
@@ -472,27 +727,15 @@ mod arnelify_server {
 
   #[pyfunction]
   fn http1_stop(py_id: usize) -> PyResult<()> {
-    if let Some(map) = HTTP1_MAP.get() {
-      if let Some(http1) = map.lock().unwrap().get(&py_id) {
-        http1.stop();
+    if let Some(map) = HTTP1_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        uds.stop();
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http2_add_header(py_stream_id: usize, py_key: &str, py_value: &str) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          stream_lock.add_header(py_key, py_value);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_add_header: No stream found.");
-        }
+    if let Some(map) = HTTP1_MAP.get() {
+      if let Some(http1) = map.lock().unwrap().get(&py_id) {
+        http1.stop();
       }
     }
 
@@ -505,7 +748,9 @@ mod arnelify_server {
       match serde_json::from_str(py_opts) {
         Ok(json) => json,
         Err(_) => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_create: Invalid JSON in 'py_opts'.");
+          println!(
+            "[Arnelify Server]: Rust PYO3 error in http2_create: Invalid JSON in 'py_opts'."
+          );
           return Ok(0);
         }
       }
@@ -517,6 +762,381 @@ mod arnelify_server {
       *py += 1;
       *py
     };
+
+    let uds_opts: UnixDomainSocketOpts = UnixDomainSocketOpts {
+      block_size_kb: get_usize(&opts, "block_size_kb"),
+      socket_path: get_str(&opts, "socket_path"),
+      thread_limit: get_u64(&opts, "thread_limit"),
+    };
+
+    let uds_http2_add_header: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let key: String = v[1].as_str().unwrap_or("").to_string();
+            let value: String = v[2].as_str().unwrap_or("").to_string();
+
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http2Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  stream_lock.add_header(&key, &value);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http2_add_header: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http2_end: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http2Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  stream_lock.end();
+                  let _ = tx.send(1);
+                }
+                None => {
+                  let args: JSON =
+                    serde_json::json!(["error", "PYO3 error in uds_http2_end: No stream found."]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http2_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let is_attachment: bool = v[1].as_u64().unwrap_or(0) != 0;
+            let bytes: Vec<u8> = bytes.lock().unwrap().clone();
+
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_bytes(&bytes, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http2_push_bytes: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http2_push_file: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let file_path: &str = v[1].as_str().unwrap_or("");
+            let is_attachment: bool = v[2].as_u64().unwrap_or(0) != 0;
+
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http2Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_file(&file_path, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http2_push_file: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http2_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let json: JSON = v[1].clone();
+            let is_attachment: bool = v[2].as_u64().unwrap_or(0) != 0;
+
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http2Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_json(&json, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http2_push_json: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http2_set_code: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let code: u64 = v[1].as_u64().unwrap_or(0);
+
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http2Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  stream_lock.set_code(code as u16);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http2_set_code: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http2_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let compression: &str = v[1].as_str().unwrap_or("");
+
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  if compression.len() > 0 {
+                    stream_lock.set_compression(Some(String::from(compression)));
+                    return;
+                  }
+
+                  stream_lock.set_compression(None);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http2_set_compression: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http2_set_headers: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let mut headers: Vec<(String, String)> = Vec::new();
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+
+            if let Some(JSON::Object(map)) = v.get(1) {
+              for (key, value) in map {
+                let value = match value {
+                  JSON::String(s) => s.clone(),
+                  JSON::Number(n) => n.to_string(),
+                  JSON::Bool(b) => b.to_string(),
+                  _ => continue,
+                };
+
+                headers.push((key.clone(), value));
+              }
+            }
+
+            if let Some(map) = HTTP2_STREAMS.get() {
+              let stream = {
+                let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http2Stream> = stream_arc.lock().unwrap();
+                  stream_lock.set_headers(headers);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http2_set_headers: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP2_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http2_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    uds.on("http2_add_header", uds_http2_add_header);
+    uds.on("http2_end", uds_http2_end);
+    uds.on("http2_push_bytes", uds_http2_push_bytes);
+    uds.on("http2_push_file", uds_http2_push_file);
+    uds.on("http2_push_json", uds_http2_push_json);
+    uds.on("http2_set_code", uds_http2_set_code);
+    uds.on("http2_set_compression", uds_http2_set_compression);
+    uds.on("http2_set_headers", uds_http2_set_headers);
+
+    let uds_map: &Mutex<HashMap<usize, Arc<UnixDomainSocket>>> =
+      HTTP2_UDS_MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+      uds_map.lock().unwrap().insert(new_id, Arc::new(uds));
+    }
 
     let http2_opts: Http2Opts = Http2Opts {
       allow_empty_files: get_bool(&opts, "allow_empty_files"),
@@ -553,35 +1173,24 @@ mod arnelify_server {
       map.lock().unwrap().remove(&py_id);
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http2_end(py_stream_id: usize) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          stream_lock.end();
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_end: No stream found.");
-        }
-      }
+    if let Some(map) = HTTP2_UDS_MAP.get() {
+      map.lock().unwrap().remove(&py_id);
     }
 
     Ok(())
   }
 
   #[pyfunction]
-  fn http2_logger(py_id: usize, py_cb: Py<PyAny>) -> PyResult<()> {
-    let http2_logger: Arc<Http2Logger> = Arc::new(move |level: &str, message: &str| {
-      Python::attach(|py| {
-        if let Err(err) = py_cb.call1(py, (level, message)) {
-          err.print(py);
+  fn http2_logger(py_id: usize) -> PyResult<()> {
+    let http2_logger: Arc<Http2Logger> = Arc::new(move |level: &str, message: &str| -> () {
+      let args: JSON = serde_json::json!([level, message]);
+      let bytes: UnixDomainSocketBytes = Vec::new();
+
+      if let Some(map) = HTTP2_UDS_MAP.get() {
+        if let Some(uds) = map.lock().unwrap().get(&py_id) {
+          uds.push("http2_logger", &args, bytes, true);
         }
-      });
+      }
     });
 
     if let Some(map) = HTTP2_MAP.get() {
@@ -594,27 +1203,61 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn http2_on(py_id: usize, py_path: &str, py_cb: Py<PyAny>) -> PyResult<()> {
+  fn http2_on(py_id: usize, py_path: &str) -> PyResult<()> {
+    let path_safe: String = String::from(py_path);
     let http2_handler: Arc<Http2Handler> = Arc::new(
-      move |ctx: Arc<Mutex<Http2Ctx>>, stream: Arc<Mutex<Http2Stream>>| {
+      move |ctx: Arc<Mutex<Http2Ctx>>, stream: Arc<Mutex<Http2Stream>>| -> () {
+        let (tx, rx) = mpsc::channel::<u8>();
         let stream_id: usize = HTTP2_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
         HTTP2_STREAMS
           .get_or_init(|| Mutex::new(HashMap::new()))
           .lock()
           .unwrap()
-          .insert(stream_id, stream);
+          .insert(stream_id, (stream, tx));
 
-        let json: String = {
-          let ctx_lock = ctx.lock().unwrap();
-          serde_json::to_string(&*ctx_lock).unwrap()
-        };
+        let ctx: Http2Ctx = ctx.lock().unwrap().clone();
+        let args: JSON = serde_json::json!([stream_id, path_safe, ctx]);
+        let bytes: UnixDomainSocketBytes = Vec::new();
 
-        Python::attach(|py| {
-          if let Err(err) = py_cb.call1(py, (stream_id, json)) {
-            err.print(py);
+        if let Some(map) = HTTP2_UDS_MAP.get() {
+          if let Some(uds) = map.lock().unwrap().get(&py_id) {
+            uds.push("http2_on", &args, bytes, true);
           }
-        });
+        }
+
+        loop {
+          match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(val) => {
+              if val == 1 {
+                break;
+              }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+              let args: JSON =
+                serde_json::json!(["error", "PYO3 error in http2_on: Stream response timeout."]);
+              if let Some(map) = HTTP2_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("http2_logger", &args, Vec::new(), true);
+                }
+              }
+              break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+              let args: JSON = serde_json::json!([
+                "error",
+                "PYO3 error in http2_on: Stream channel disconnected."
+              ]);
+              if let Some(map) = HTTP2_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("http2_logger", &args, Vec::new(), true);
+                }
+              }
+
+              break;
+            }
+          }
+        }
 
         if let Some(map) = HTTP2_STREAMS.get() {
           map.lock().unwrap().remove(&stream_id);
@@ -632,165 +1275,25 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn http2_push_bytes(
-    py_stream_id: usize,
-    py_bytes: &[u8],
-    py_is_attachment: usize,
-  ) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          if py_bytes.is_empty() {
-            let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-            stream_lock.push_bytes(&[], is_attachment);
-            return Ok(());
-          }
+  fn http2_start_ipc(py_id: usize) -> PyResult<()> {
+    let (tx, rx) = mpsc::channel::<u8>();
 
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          stream_lock.push_bytes(py_bytes, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_push_bytes: No stream found.");
-        }
+    if let Some(map) = HTTP2_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        let uds_safe: Arc<UnixDomainSocket> = Arc::clone(uds);
+        thread::spawn(move || {
+          uds_safe.start(Arc::new(move || {
+            let _ = tx.send(1);
+          }));
+        });
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http2_push_file(
-    py_stream_id: usize,
-    py_file_path: &str,
-    py_is_attachment: usize,
-  ) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          stream_lock.push_file(py_file_path, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_push_file: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http2_push_json(py_stream_id: usize, py_json: &str, py_is_attachment: usize) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          let json: JSON = match serde_json::from_str(py_json) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in http2_push_json: Invalid JSON in 'py_json'."
-              );
-
-              return Ok(());
-            }
-          };
-
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          stream_lock.push_json(&json, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_push_json: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http2_set_code(py_stream_id: usize, py_code: usize) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          stream_lock.set_code(py_code as u16);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_set_code: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http2_set_compression(py_stream_id: usize, py_compression: &str) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          if py_compression.len() > 0 {
-            stream_lock.set_compression(Some(String::from(py_compression)));
-            return Ok(());
-          }
-
-          stream_lock.set_compression(None);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_set_compression: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http2_set_headers(py_stream_id: usize, py_headers: &str) -> PyResult<()> {
-    if let Some(map) = HTTP2_STREAMS.get() {
-      let streams: MutexGuard<'_, Http2Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let json: Vec<JSON> = match serde_json::from_str(py_headers) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in http2_set_headers: Invalid JSON in 'py_headers'."
-              );
-              return Ok(());
-            }
-          };
-
-          let mut headers: Vec<(String, String)> = Vec::new();
-          for header in json {
-            if let JSON::Object(pair) = header {
-              for (key, value) in pair {
-                let value = match value {
-                  JSON::String(s) => s,
-                  JSON::Number(n) => n.to_string(),
-                  JSON::Bool(b) => b.to_string(),
-                  _ => continue,
-                };
-                headers.push((key, value));
-              }
-            }
-          }
-
-          let mut stream_lock: std::sync::MutexGuard<'_, Http2Stream> = stream.lock().unwrap();
-          stream_lock.set_headers(headers);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http2_set_headers: No stream found.");
-        }
+    loop {
+      match rx.recv() {
+        Ok(1) => break,
+        Ok(_) => continue,
+        Err(_) => break,
       }
     }
 
@@ -801,9 +1304,9 @@ mod arnelify_server {
   fn http2_start(py_id: usize) -> PyResult<()> {
     if let Some(map) = HTTP2_MAP.get() {
       if let Some(http2) = map.lock().unwrap().get(&py_id) {
-        let http2 = http2.clone();
-        std::thread::spawn(move || {
-          http2.start();
+        let http2_safe: Arc<Http2> = Arc::clone(http2);
+        thread::spawn(move || {
+          http2_safe.start();
         });
       }
     }
@@ -813,27 +1316,15 @@ mod arnelify_server {
 
   #[pyfunction]
   fn http2_stop(py_id: usize) -> PyResult<()> {
-    if let Some(map) = HTTP2_MAP.get() {
-      if let Some(http2) = map.lock().unwrap().get(&py_id) {
-        http2.stop();
+    if let Some(map) = HTTP2_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        uds.stop();
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn ws_close(py_stream_id: usize) -> PyResult<()> {
-    if let Some(map) = WS_STREAMS.get() {
-      let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, WebSocketStream> = stream.lock().unwrap();
-          stream_lock.close();
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in ws_close: No stream found.");
-        }
+    if let Some(map) = HTTP2_MAP.get() {
+      if let Some(http2) = map.lock().unwrap().get(&py_id) {
+        http2.stop();
       }
     }
 
@@ -858,6 +1349,232 @@ mod arnelify_server {
       *py += 1;
       *py
     };
+
+    let uds_opts: UnixDomainSocketOpts = UnixDomainSocketOpts {
+      block_size_kb: get_usize(&opts, "block_size_kb"),
+      socket_path: get_str(&opts, "socket_path"),
+      thread_limit: get_u64(&opts, "thread_limit"),
+    };
+
+    let uds_ws_close: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            if let Some(map) = WS_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+                  stream_lock.close();
+                  let _ = tx.send(1);
+                }
+                None => {
+                  let args: JSON =
+                    serde_json::json!(["error", "PYO3 error in uds_ws_close: No stream found."]);
+
+                  if let Some(map) = WS_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("ws_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_ws_push: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let json: JSON = v[1].clone();
+            let bytes: Vec<u8> = bytes.lock().unwrap().clone();
+
+            if let Some(map) = WS_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+                  stream_lock.push(&json, &bytes);
+                }
+                None => {
+                  let args: JSON =
+                    serde_json::json!(["error", "PYO3 error in uds_ws_push: No stream found."]);
+
+                  if let Some(map) = WS_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("ws_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_ws_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let bytes: Vec<u8> = bytes.lock().unwrap().clone();
+
+            if let Some(map) = WS_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+                  stream_lock.push_bytes(&bytes);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_ws_push_bytes: No stream found."
+                  ]);
+
+                  if let Some(map) = WS_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("ws_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_ws_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let json: JSON = v[1].clone();
+
+            if let Some(map) = WS_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+                  stream_lock.push_json(&json);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_ws_push_json: No stream found."
+                  ]);
+
+                  if let Some(map) = WS_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("ws_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_ws_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let compression: &str = v[1].as_str().unwrap_or("");
+
+            if let Some(map) = WS_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+                  if compression.len() > 0 {
+                    stream_lock.set_compression(Some(String::from(compression)));
+                    return;
+                  }
+
+                  stream_lock.set_compression(None);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_ws_set_compression: No stream found."
+                  ]);
+
+                  if let Some(map) = WS_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("ws_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    uds.on("ws_close", uds_ws_close);
+    uds.on("ws_push", uds_ws_push);
+    uds.on("ws_push_bytes", uds_ws_push_bytes);
+    uds.on("ws_push_json", uds_ws_push_json);
+    uds.on("ws_set_compression", uds_ws_set_compression);
+
+    let uds_map: &Mutex<HashMap<usize, Arc<UnixDomainSocket>>> =
+      WS_UDS_MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+      uds_map.lock().unwrap().insert(new_id, Arc::new(uds));
+    }
 
     let ws_opts: WebSocketOpts = WebSocketOpts {
       block_size_kb: get_usize(&opts, "block_size_kb"),
@@ -886,17 +1603,24 @@ mod arnelify_server {
       map.lock().unwrap().remove(&py_id);
     }
 
+    if let Some(map) = WS_UDS_MAP.get() {
+      map.lock().unwrap().remove(&py_id);
+    }
+
     Ok(())
   }
 
   #[pyfunction]
-  fn ws_logger(py_id: usize, py_cb: Py<PyAny>) -> PyResult<()> {
-    let ws_logger: Arc<WebSocketLogger> = Arc::new(move |level: &str, message: &str| {
-      Python::attach(|py| {
-        if let Err(err) = py_cb.call1(py, (level, message)) {
-          err.print(py);
+  fn ws_logger(py_id: usize) -> PyResult<()> {
+    let ws_logger: Arc<WebSocketLogger> = Arc::new(move |level: &str, message: &str| -> () {
+      let args: JSON = serde_json::json!([level, message]);
+      let bytes: UnixDomainSocketBytes = Vec::new();
+
+      if let Some(map) = WS_UDS_MAP.get() {
+        if let Some(uds) = map.lock().unwrap().get(&py_id) {
+          uds.push("ws_logger", &args, bytes, true);
         }
-      });
+      }
     });
 
     if let Some(map) = WS_MAP.get() {
@@ -909,35 +1633,62 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn ws_on(py_id: usize, py_topic: &str, py_cb: Py<PyAny>) -> PyResult<()> {
+  fn ws_on(py_id: usize, py_topic: &str) -> PyResult<()> {
+    let topic_safe: String = String::from(py_topic);
     let ws_handler: Arc<WebSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<WebSocketCtx>>,
             bytes: Arc<Mutex<WebSocketBytes>>,
-            stream: Arc<Mutex<WebSocketStream>>| {
+            stream: Arc<Mutex<WebSocketStream>>|
+            -> () {
+        let (tx, rx) = mpsc::channel::<u8>();
         let stream_id: usize = WS_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
         WS_STREAMS
           .get_or_init(|| Mutex::new(HashMap::new()))
           .lock()
           .unwrap()
-          .insert(stream_id, stream);
+          .insert(stream_id, (stream, tx));
 
-        let json: String = {
-          let ctx_lock = ctx.lock().unwrap();
-          serde_json::to_string(&*ctx_lock).unwrap()
-        };
+        let ctx: WebSocketCtx = ctx.lock().unwrap().clone();
+        let args: JSON = serde_json::json!([stream_id, topic_safe, ctx]);
+        let bytes: WebSocketBytes = bytes.lock().unwrap().clone();
 
-        let data: Vec<u8> = {
-          let locked: MutexGuard<'_, Vec<u8>> = bytes.lock().unwrap();
-          locked.clone()
-        };
-
-        Python::attach(|py| {
-          let py_bytes: Bound<'_, PyBytes> = PyBytes::new(py, &data);
-          if let Err(err) = py_cb.call1(py, (stream_id, json, py_bytes)) {
-            err.print(py);
+        if let Some(map) = WS_UDS_MAP.get() {
+          if let Some(uds) = map.lock().unwrap().get(&py_id) {
+            uds.push("ws_on", &args, bytes, true);
           }
-        });
+        }
+
+        loop {
+          match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(val) => {
+              if val == 1 {
+                break;
+              }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+              let args: JSON =
+                serde_json::json!(["error", "PYO3 error in ws_on: Stream response timeout."]);
+              if let Some(map) = WS_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("ws_logger", &args, Vec::new(), true);
+                }
+              }
+              break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+              let args: JSON =
+                serde_json::json!(["error", "PYO3 error in ws_on: Stream channel disconnected."]);
+              if let Some(map) = WS_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("ws_logger", &args, Vec::new(), true);
+                }
+              }
+
+              break;
+            }
+          }
+        }
 
         if let Some(map) = WS_STREAMS.get() {
           map.lock().unwrap().remove(&stream_id);
@@ -955,112 +1706,25 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn ws_push(py_stream_id: usize, py_json: &str, py_bytes: &[u8]) -> PyResult<()> {
-    if let Some(map) = WS_STREAMS.get() {
-      let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let json: JSON = match serde_json::from_str(py_json) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in ws_push: Invalid JSON in 'py_json'."
-              );
+  fn ws_start_ipc(py_id: usize) -> PyResult<()> {
+    let (tx, rx) = mpsc::channel::<u8>();
 
-              return Ok(());
-            }
-          };
-
-          if py_bytes.is_empty() {
-            let mut stream_lock: std::sync::MutexGuard<'_, WebSocketStream> =
-              stream.lock().unwrap();
-            stream_lock.push(&json, &[]);
-            return Ok(());
-          }
-
-          let mut stream_lock: std::sync::MutexGuard<'_, WebSocketStream> = stream.lock().unwrap();
-          stream_lock.push(&json, py_bytes);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in ws_push: No stream found.");
-        }
+    if let Some(map) = WS_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        let uds_safe: Arc<UnixDomainSocket> = Arc::clone(uds);
+        thread::spawn(move || {
+          uds_safe.start(Arc::new(move || {
+            let _ = tx.send(1);
+          }));
+        });
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn ws_push_bytes(py_stream_id: usize, py_bytes: &[u8]) -> PyResult<()> {
-    if let Some(map) = WS_STREAMS.get() {
-      let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          if py_bytes.is_empty() {
-            let mut stream_lock: std::sync::MutexGuard<'_, WebSocketStream> =
-              stream.lock().unwrap();
-            stream_lock.push_bytes(&[]);
-            return Ok(());
-          }
-
-          let mut stream_lock: std::sync::MutexGuard<'_, WebSocketStream> = stream.lock().unwrap();
-          stream_lock.push_bytes(py_bytes);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in ws_push_bytes: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn ws_push_json(py_stream_id: usize, py_json: &str) -> PyResult<()> {
-    if let Some(map) = WS_STREAMS.get() {
-      let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let json: JSON = match serde_json::from_str(py_json) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in ws_push_json: Invalid JSON in 'py_json'."
-              );
-
-              return Ok(());
-            }
-          };
-
-          let mut stream_lock: std::sync::MutexGuard<'_, WebSocketStream> = stream.lock().unwrap();
-          stream_lock.push_json(&json);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in ws_push_json: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn ws_set_compression(py_stream_id: usize, py_compression: &str) -> PyResult<()> {
-    if let Some(map) = WS_STREAMS.get() {
-      let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, WebSocketStream> = stream.lock().unwrap();
-          if py_compression.len() > 0 {
-            stream_lock.set_compression(Some(String::from(py_compression)));
-            return Ok(());
-          }
-
-          stream_lock.set_compression(None);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in ws_set_compression: No stream found.");
-        }
+    loop {
+      match rx.recv() {
+        Ok(1) => break,
+        Ok(_) => continue,
+        Err(_) => break,
       }
     }
 
@@ -1071,9 +1735,9 @@ mod arnelify_server {
   fn ws_start(py_id: usize) -> PyResult<()> {
     if let Some(map) = WS_MAP.get() {
       if let Some(ws) = map.lock().unwrap().get(&py_id) {
-        let ws = ws.clone();
-        std::thread::spawn(move || {
-          ws.start();
+        let ws_safe: Arc<WebSocket> = Arc::clone(ws);
+        thread::spawn(move || {
+          ws_safe.start();
         });
       }
     }
@@ -1083,27 +1747,15 @@ mod arnelify_server {
 
   #[pyfunction]
   fn ws_stop(py_id: usize) -> PyResult<()> {
-    if let Some(map) = WS_MAP.get() {
-      if let Some(ws) = map.lock().unwrap().get(&py_id) {
-        ws.stop();
+    if let Some(map) = WS_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        uds.stop();
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http3_add_header(py_stream_id: usize, py_key: &str, py_value: &str) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          stream_lock.add_header(py_key, py_value);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_add_header: No stream found.");
-        }
+    if let Some(map) = WS_MAP.get() {
+      if let Some(ws) = map.lock().unwrap().get(&py_id) {
+        ws.stop();
       }
     }
 
@@ -1116,7 +1768,9 @@ mod arnelify_server {
       match serde_json::from_str(py_opts) {
         Ok(json) => json,
         Err(_) => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_create: Invalid JSON in 'py_opts'.");
+          println!(
+            "[Arnelify Server]: Rust PYO3 error in http3_create: Invalid JSON in 'py_opts'."
+          );
           return Ok(0);
         }
       }
@@ -1128,6 +1782,381 @@ mod arnelify_server {
       *py += 1;
       *py
     };
+
+    let uds_opts: UnixDomainSocketOpts = UnixDomainSocketOpts {
+      block_size_kb: get_usize(&opts, "block_size_kb"),
+      socket_path: get_str(&opts, "socket_path"),
+      thread_limit: get_u64(&opts, "thread_limit"),
+    };
+
+    let uds_http3_add_header: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let key: String = v[1].as_str().unwrap_or("").to_string();
+            let value: String = v[2].as_str().unwrap_or("").to_string();
+
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  stream_lock.add_header(&key, &value);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http3_add_header: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http3_end: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  stream_lock.end();
+                  let _ = tx.send(1);
+                }
+                None => {
+                  let args: JSON =
+                    serde_json::json!(["error", "PYO3 error in uds_http3_end: No stream found."]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http3_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let is_attachment: bool = v[1].as_u64().unwrap_or(0) != 0;
+            let bytes: Vec<u8> = bytes.lock().unwrap().clone();
+
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_bytes(&bytes, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http3_push_bytes: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http3_push_file: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let file_path: &str = v[1].as_str().unwrap_or("");
+            let is_attachment: bool = v[2].as_u64().unwrap_or(0) != 0;
+
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_file(&file_path, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http3_push_file: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http3_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let json: JSON = v[1].clone();
+            let is_attachment: bool = v[2].as_u64().unwrap_or(0) != 0;
+
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  stream_lock.push_json(&json, is_attachment);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http3_push_json: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http3_set_code: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let code: u64 = v[1].as_u64().unwrap_or(0);
+
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  stream_lock.set_code(code as u16);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http3_set_code: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http3_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let compression: &str = v[1].as_str().unwrap_or("");
+
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  if compression.len() > 0 {
+                    stream_lock.set_compression(Some(String::from(compression)));
+                    return;
+                  }
+
+                  stream_lock.set_compression(None);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http3_set_compression: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_http3_set_headers: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let mut headers: Vec<(String, String)> = Vec::new();
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+
+            if let Some(JSON::Object(map)) = v.get(1) {
+              for (key, value) in map {
+                let value = match value {
+                  JSON::String(s) => s.clone(),
+                  JSON::Number(n) => n.to_string(),
+                  JSON::Bool(b) => b.to_string(),
+                  _ => continue,
+                };
+
+                headers.push((key.clone(), value));
+              }
+            }
+
+            if let Some(map) = HTTP3_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<Http3Stream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, Http3Stream> = stream_arc.lock().unwrap();
+                  stream_lock.set_headers(headers);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_http3_set_headers: No stream found."
+                  ]);
+
+                  if let Some(map) = HTTP3_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("http3_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    uds.on("http3_add_header", uds_http3_add_header);
+    uds.on("http3_end", uds_http3_end);
+    uds.on("http3_push_bytes", uds_http3_push_bytes);
+    uds.on("http3_push_file", uds_http3_push_file);
+    uds.on("http3_push_json", uds_http3_push_json);
+    uds.on("http3_set_code", uds_http3_set_code);
+    uds.on("http3_set_compression", uds_http3_set_compression);
+    uds.on("http3_set_headers", uds_http3_set_headers);
+
+    let uds_map: &Mutex<HashMap<usize, Arc<UnixDomainSocket>>> =
+      HTTP3_UDS_MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+      uds_map.lock().unwrap().insert(new_id, Arc::new(uds));
+    }
 
     let http3_opts: Http3Opts = Http3Opts {
       allow_empty_files: get_bool(&opts, "allow_empty_files"),
@@ -1164,35 +2193,24 @@ mod arnelify_server {
       map.lock().unwrap().remove(&py_id);
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http3_end(py_stream_id: usize) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          stream_lock.end();
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_end: No stream found.");
-        }
-      }
+    if let Some(map) = HTTP3_UDS_MAP.get() {
+      map.lock().unwrap().remove(&py_id);
     }
 
     Ok(())
   }
 
   #[pyfunction]
-  fn http3_logger(py_id: usize, py_cb: Py<PyAny>) -> PyResult<()> {
-    let http3_logger: Arc<Http3Logger> = Arc::new(move |level: &str, message: &str| {
-      Python::attach(|py| {
-        if let Err(err) = py_cb.call1(py, (level, message)) {
-          err.print(py);
+  fn http3_logger(py_id: usize) -> PyResult<()> {
+    let http3_logger: Arc<Http3Logger> = Arc::new(move |level: &str, message: &str| -> () {
+      let args: JSON = serde_json::json!([level, message]);
+      let bytes: UnixDomainSocketBytes = Vec::new();
+
+      if let Some(map) = HTTP3_UDS_MAP.get() {
+        if let Some(uds) = map.lock().unwrap().get(&py_id) {
+          uds.push("http3_logger", &args, bytes, true);
         }
-      });
+      }
     });
 
     if let Some(map) = HTTP3_MAP.get() {
@@ -1205,27 +2223,61 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn http3_on(py_id: usize, py_path: &str, py_cb: Py<PyAny>) -> PyResult<()> {
+  fn http3_on(py_id: usize, py_path: &str) -> PyResult<()> {
+    let path_safe: String = String::from(py_path);
     let http3_handler: Arc<Http3Handler> = Arc::new(
-      move |ctx: Arc<Mutex<Http3Ctx>>, stream: Arc<Mutex<Http3Stream>>| {
+      move |ctx: Arc<Mutex<Http3Ctx>>, stream: Arc<Mutex<Http3Stream>>| -> () {
+        let (tx, rx) = mpsc::channel::<u8>();
         let stream_id: usize = HTTP3_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
         HTTP3_STREAMS
           .get_or_init(|| Mutex::new(HashMap::new()))
           .lock()
           .unwrap()
-          .insert(stream_id, stream);
+          .insert(stream_id, (stream, tx));
 
-        let json: String = {
-          let ctx_lock = ctx.lock().unwrap();
-          serde_json::to_string(&*ctx_lock).unwrap()
-        };
+        let ctx: Http3Ctx = ctx.lock().unwrap().clone();
+        let args: JSON = serde_json::json!([stream_id, path_safe, ctx]);
+        let bytes: UnixDomainSocketBytes = Vec::new();
 
-        Python::attach(|py| {
-          if let Err(err) = py_cb.call1(py, (stream_id, json)) {
-            err.print(py);
+        if let Some(map) = HTTP3_UDS_MAP.get() {
+          if let Some(uds) = map.lock().unwrap().get(&py_id) {
+            uds.push("http3_on", &args, bytes, true);
           }
-        });
+        }
+
+        loop {
+          match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(val) => {
+              if val == 1 {
+                break;
+              }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+              let args: JSON =
+                serde_json::json!(["error", "PYO3 error in http3_on: Stream response timeout."]);
+              if let Some(map) = HTTP3_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("http3_logger", &args, Vec::new(), true);
+                }
+              }
+              break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+              let args: JSON = serde_json::json!([
+                "error",
+                "PYO3 error in http3_on: Stream channel disconnected."
+              ]);
+              if let Some(map) = HTTP3_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("http3_logger", &args, Vec::new(), true);
+                }
+              }
+
+              break;
+            }
+          }
+        }
 
         if let Some(map) = HTTP3_STREAMS.get() {
           map.lock().unwrap().remove(&stream_id);
@@ -1243,165 +2295,25 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn http3_push_bytes(
-    py_stream_id: usize,
-    py_bytes: &[u8],
-    py_is_attachment: usize,
-  ) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          if py_bytes.is_empty() {
-            let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-            stream_lock.push_bytes(&[], is_attachment);
-            return Ok(());
-          }
+  fn http3_start_ipc(py_id: usize) -> PyResult<()> {
+    let (tx, rx) = mpsc::channel::<u8>();
 
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          stream_lock.push_bytes(py_bytes, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_push_bytes: No stream found.");
-        }
+    if let Some(map) = HTTP3_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        let uds_safe: Arc<UnixDomainSocket> = Arc::clone(uds);
+        thread::spawn(move || {
+          uds_safe.start(Arc::new(move || {
+            let _ = tx.send(1);
+          }));
+        });
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http3_push_file(
-    py_stream_id: usize,
-    py_file_path: &str,
-    py_is_attachment: usize,
-  ) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          stream_lock.push_file(py_file_path, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_push_file: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http3_push_json(py_stream_id: usize, py_json: &str, py_is_attachment: usize) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let is_attachment: bool = py_is_attachment == 1;
-          let json: JSON = match serde_json::from_str(py_json) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in http3_push_json: Invalid JSON in 'py_json'."
-              );
-
-              return Ok(());
-            }
-          };
-
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          stream_lock.push_json(&json, is_attachment);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_push_json: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http3_set_code(py_stream_id: usize, py_code: usize) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          stream_lock.set_code(py_code as u16);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_set_code: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http3_set_compression(py_stream_id: usize, py_compression: &str) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          if py_compression.len() > 0 {
-            stream_lock.set_compression(Some(String::from(py_compression)));
-            return Ok(());
-          }
-
-          stream_lock.set_compression(None);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_set_compression: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn http3_set_headers(py_stream_id: usize, py_headers: &str) -> PyResult<()> {
-    if let Some(map) = HTTP3_STREAMS.get() {
-      let streams: MutexGuard<'_, Http3Streams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let json: Vec<JSON> = match serde_json::from_str(py_headers) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in http3_set_headers: Invalid JSON in 'py_headers'."
-              );
-              return Ok(());
-            }
-          };
-
-          let mut headers: Vec<(String, String)> = Vec::new();
-          for header in json {
-            if let JSON::Object(pair) = header {
-              for (key, value) in pair {
-                let value = match value {
-                  JSON::String(s) => s,
-                  JSON::Number(n) => n.to_string(),
-                  JSON::Bool(b) => b.to_string(),
-                  _ => continue,
-                };
-                headers.push((key, value));
-              }
-            }
-          }
-
-          let mut stream_lock: std::sync::MutexGuard<'_, Http3Stream> = stream.lock().unwrap();
-          stream_lock.set_headers(headers);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in http3_set_headers: No stream found.");
-        }
+    loop {
+      match rx.recv() {
+        Ok(1) => break,
+        Ok(_) => continue,
+        Err(_) => break,
       }
     }
 
@@ -1412,9 +2324,9 @@ mod arnelify_server {
   fn http3_start(py_id: usize) -> PyResult<()> {
     if let Some(map) = HTTP3_MAP.get() {
       if let Some(http3) = map.lock().unwrap().get(&py_id) {
-        let http3 = http3.clone();
-        std::thread::spawn(move || {
-          http3.start();
+        let http3_safe: Arc<Http3> = Arc::clone(http3);
+        thread::spawn(move || {
+          http3_safe.start();
         });
       }
     }
@@ -1424,28 +2336,15 @@ mod arnelify_server {
 
   #[pyfunction]
   fn http3_stop(py_id: usize) -> PyResult<()> {
-    if let Some(map) = HTTP3_MAP.get() {
-      if let Some(http3) = map.lock().unwrap().get(&py_id) {
-        http3.stop();
+    if let Some(map) = HTTP3_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        uds.stop();
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn wt_close(py_stream_id: usize) -> PyResult<()> {
-    if let Some(map) = WT_STREAMS.get() {
-      let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, WebTransportStream> =
-            stream.lock().unwrap();
-          stream_lock.close();
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in wt_close: No stream found.");
-        }
+    if let Some(map) = HTTP3_MAP.get() {
+      if let Some(http3) = map.lock().unwrap().get(&py_id) {
+        http3.stop();
       }
     }
 
@@ -1470,6 +2369,237 @@ mod arnelify_server {
       *py += 1;
       *py
     };
+
+    let uds_opts: UnixDomainSocketOpts = UnixDomainSocketOpts {
+      block_size_kb: get_usize(&opts, "block_size_kb"),
+      socket_path: get_str(&opts, "socket_path"),
+      thread_limit: get_u64(&opts, "thread_limit"),
+    };
+
+    let uds_wt_close: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+
+            if let Some(map) = WT_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebTransportStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebTransportStream> =
+                    stream_arc.lock().unwrap();
+                  stream_lock.close();
+                  let _ = tx.send(1);
+                }
+                None => {
+                  let args: JSON =
+                    serde_json::json!(["error", "PYO3 error in uds_wt_close: No stream found."]);
+
+                  if let Some(map) = WT_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("wt_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_wt_push: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let json: JSON = v[1].clone();
+            let bytes: Vec<u8> = bytes.lock().unwrap().clone();
+
+            if let Some(map) = WT_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebTransportStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebTransportStream> =
+                    stream_arc.lock().unwrap();
+                  stream_lock.push(&json, &bytes);
+                }
+                None => {
+                  let args: JSON =
+                    serde_json::json!(["error", "PYO3 error in uds_wt_push: No stream found."]);
+
+                  if let Some(map) = WT_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("wt_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_wt_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let bytes: Vec<u8> = bytes.lock().unwrap().clone();
+            if let Some(map) = WT_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebTransportStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebTransportStream> =
+                    stream_arc.lock().unwrap();
+                  stream_lock.push_bytes(&bytes);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_wt_push_bytes: No stream found."
+                  ]);
+
+                  if let Some(map) = WT_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("wt_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_wt_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let json: JSON = v[1].clone();
+
+            if let Some(map) = WT_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebTransportStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebTransportStream> =
+                    stream_arc.lock().unwrap();
+                  stream_lock.push_json(&json);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_wt_push_json: No stream found."
+                  ]);
+
+                  if let Some(map) = WT_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("wt_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let uds_wt_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            -> () {
+        let args: JSON = ctx.lock().unwrap().clone();
+
+        match args.as_array() {
+          Some(v) => {
+            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let compression: &str = v[1].as_str().unwrap_or("");
+
+            if let Some(map) = WT_STREAMS.get() {
+              let stream: Option<(Arc<Mutex<WebTransportStream>>, mpsc::Sender<u8>)> = {
+                let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
+                streams.get(&stream_id).cloned()
+              };
+
+              match stream {
+                Some((stream_arc, _tx)) => {
+                  let mut stream_lock: MutexGuard<'_, WebTransportStream> =
+                    stream_arc.lock().unwrap();
+                  if compression.len() > 0 {
+                    stream_lock.set_compression(Some(String::from(compression)));
+                    return;
+                  }
+
+                  stream_lock.set_compression(None);
+                }
+                None => {
+                  let args: JSON = serde_json::json!([
+                    "error",
+                    "PYO3 error in uds_wt_set_compression: No stream found."
+                  ]);
+
+                  if let Some(map) = WT_UDS_MAP.get() {
+                    if let Some(uds) = map.lock().unwrap().get(&new_id) {
+                      uds.push("wt_logger", &args, Vec::new(), true);
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None => {}
+        }
+      },
+    );
+
+    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    uds.on("wt_close", uds_wt_close);
+    uds.on("wt_push", uds_wt_push);
+    uds.on("wt_push_bytes", uds_wt_push_bytes);
+    uds.on("wt_push_json", uds_wt_push_json);
+    uds.on("wt_set_compression", uds_wt_set_compression);
+
+    let uds_map: &Mutex<HashMap<usize, Arc<UnixDomainSocket>>> =
+      WT_UDS_MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+      uds_map.lock().unwrap().insert(new_id, Arc::new(uds));
+    }
 
     let wt_opts: WebTransportOpts = WebTransportOpts {
       block_size_kb: get_usize(&opts, "block_size_kb"),
@@ -1504,13 +2634,16 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn wt_logger(py_id: usize, py_cb: Py<PyAny>) -> PyResult<()> {
-    let wt_logger: Arc<WebTransportLogger> = Arc::new(move |level: &str, message: &str| {
-      Python::attach(|py| {
-        if let Err(err) = py_cb.call1(py, (level, message)) {
-          err.print(py);
+  fn wt_logger(py_id: usize) -> PyResult<()> {
+    let wt_logger: Arc<WebTransportLogger> = Arc::new(move |level: &str, message: &str| -> () {
+      let args: JSON = serde_json::json!([level, message]);
+      let bytes: UnixDomainSocketBytes = Vec::new();
+
+      if let Some(map) = WT_UDS_MAP.get() {
+        if let Some(uds) = map.lock().unwrap().get(&py_id) {
+          uds.push("wt_logger", &args, bytes, true);
         }
-      });
+      }
     });
 
     if let Some(map) = WT_MAP.get() {
@@ -1523,35 +2656,62 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn wt_on(py_id: usize, py_topic: &str, py_cb: Py<PyAny>) -> PyResult<()> {
+  fn wt_on(py_id: usize, py_topic: &str) -> PyResult<()> {
+    let topic_safe: String = String::from(py_topic);
     let wt_handler: Arc<WebTransportHandler> = Arc::new(
       move |ctx: Arc<Mutex<WebTransportCtx>>,
             bytes: Arc<Mutex<WebTransportBytes>>,
-            stream: Arc<Mutex<WebTransportStream>>| {
+            stream: Arc<Mutex<WebTransportStream>>|
+            -> () {
+        let (tx, rx) = mpsc::channel::<u8>();
         let stream_id: usize = WT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
 
         WT_STREAMS
           .get_or_init(|| Mutex::new(HashMap::new()))
           .lock()
           .unwrap()
-          .insert(stream_id, stream);
+          .insert(stream_id, (stream, tx));
 
-        let json: String = {
-          let ctx_lock = ctx.lock().unwrap();
-          serde_json::to_string(&*ctx_lock).unwrap()
-        };
+        let ctx: WebTransportCtx = ctx.lock().unwrap().clone();
+        let args: JSON = serde_json::json!([stream_id, topic_safe, ctx]);
+        let bytes: WebTransportBytes = bytes.lock().unwrap().clone();
 
-        let data: Vec<u8> = {
-          let locked: MutexGuard<'_, Vec<u8>> = bytes.lock().unwrap();
-          locked.clone()
-        };
-
-        Python::attach(|py| {
-          let py_bytes: Bound<'_, PyBytes> = PyBytes::new(py, &data);
-          if let Err(err) = py_cb.call1(py, (stream_id, json, py_bytes)) {
-            err.print(py);
+        if let Some(map) = WT_UDS_MAP.get() {
+          if let Some(uds) = map.lock().unwrap().get(&py_id) {
+            uds.push("wt_on", &args, bytes, true);
           }
-        });
+        }
+
+        loop {
+          match rx.recv_timeout(Duration::from_secs(90)) {
+            Ok(val) => {
+              if val == 1 {
+                break;
+              }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+              let args: JSON =
+                serde_json::json!(["error", "PYO3 error in wt_on: Stream response timeout."]);
+              if let Some(map) = WT_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("wt_logger", &args, Vec::new(), true);
+                }
+              }
+              break;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+              let args: JSON =
+                serde_json::json!(["error", "PYO3 error in wt_on: Stream channel disconnected."]);
+              if let Some(map) = WT_UDS_MAP.get() {
+                if let Some(uds) = map.lock().unwrap().get(&py_id) {
+                  uds.push("wt_logger", &args, Vec::new(), true);
+                }
+              }
+
+              break;
+            }
+          }
+        }
 
         if let Some(map) = WT_STREAMS.get() {
           map.lock().unwrap().remove(&stream_id);
@@ -1569,116 +2729,25 @@ mod arnelify_server {
   }
 
   #[pyfunction]
-  fn wt_push(py_stream_id: usize, py_json: &str, py_bytes: &[u8]) -> PyResult<()> {
-    if let Some(map) = WT_STREAMS.get() {
-      let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let json: JSON = match serde_json::from_str(py_json) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in wt_push: Invalid JSON in 'py_json'."
-              );
+  fn wt_start_ipc(py_id: usize) -> PyResult<()> {
+    let (tx, rx) = mpsc::channel::<u8>();
 
-              return Ok(());
-            }
-          };
-
-          if py_bytes.is_empty() {
-            let mut stream_lock: std::sync::MutexGuard<'_, WebTransportStream> =
-              stream.lock().unwrap();
-            stream_lock.push(&json, &[]);
-            return Ok(());
-          }
-
-          let mut stream_lock: std::sync::MutexGuard<'_, WebTransportStream> =
-            stream.lock().unwrap();
-          stream_lock.push(&json, py_bytes);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in wt_push: No stream found.");
-        }
+    if let Some(map) = WT_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        let uds_safe: Arc<UnixDomainSocket> = Arc::clone(uds);
+        thread::spawn(move || {
+          uds_safe.start(Arc::new(move || {
+            let _ = tx.send(1);
+          }));
+        });
       }
     }
 
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn wt_push_bytes(py_stream_id: usize, py_bytes: &[u8]) -> PyResult<()> {
-    if let Some(map) = WT_STREAMS.get() {
-      let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          if py_bytes.is_empty() {
-            let mut stream_lock: std::sync::MutexGuard<'_, WebTransportStream> =
-              stream.lock().unwrap();
-            stream_lock.push_bytes(&[]);
-            return Ok(());
-          }
-
-          let mut stream_lock: std::sync::MutexGuard<'_, WebTransportStream> =
-            stream.lock().unwrap();
-          stream_lock.push_bytes(py_bytes);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in wt_push_bytes: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn wt_push_json(py_stream_id: usize, py_json: &str) -> PyResult<()> {
-    if let Some(map) = WT_STREAMS.get() {
-      let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let json: JSON = match serde_json::from_str(py_json) {
-            Ok(json) => json,
-            Err(_) => {
-              println!(
-                "[Arnelify Server]: Rust PYO3 error in wt_push_json: Invalid JSON in 'py_json'."
-              );
-
-              return Ok(());
-            }
-          };
-
-          let mut stream_lock: std::sync::MutexGuard<'_, WebTransportStream> =
-            stream.lock().unwrap();
-          stream_lock.push_json(&json);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in wt_push_json: No stream found.");
-        }
-      }
-    }
-
-    Ok(())
-  }
-
-  #[pyfunction]
-  fn wt_set_compression(py_stream_id: usize, py_compression: &str) -> PyResult<()> {
-    if let Some(map) = WT_STREAMS.get() {
-      let streams: MutexGuard<'_, WebTransportStreams> = map.lock().unwrap();
-      match streams.get(&py_stream_id) {
-        Some(stream) => {
-          let mut stream_lock: std::sync::MutexGuard<'_, WebTransportStream> =
-            stream.lock().unwrap();
-          if py_compression.len() > 0 {
-            stream_lock.set_compression(Some(String::from(py_compression)));
-            return Ok(());
-          }
-
-          stream_lock.set_compression(None);
-        }
-        None => {
-          println!("[Arnelify Server]: Rust PYO3 error in wt_set_compression: No stream found.");
-        }
+    loop {
+      match rx.recv() {
+        Ok(1) => break,
+        Ok(_) => continue,
+        Err(_) => break,
       }
     }
 
@@ -1689,9 +2758,9 @@ mod arnelify_server {
   fn wt_start(py_id: usize) -> PyResult<()> {
     if let Some(map) = WT_MAP.get() {
       if let Some(wt) = map.lock().unwrap().get(&py_id) {
-        let wt = wt.clone();
-        std::thread::spawn(move || {
-          wt.start();
+        let wt_safe: Arc<WebTransport> = Arc::clone(wt);
+        thread::spawn(move || {
+          wt_safe.start();
         });
       }
     }
@@ -1701,6 +2770,12 @@ mod arnelify_server {
 
   #[pyfunction]
   fn wt_stop(py_id: usize) -> PyResult<()> {
+    if let Some(map) = WT_UDS_MAP.get() {
+      if let Some(uds) = map.lock().unwrap().get(&py_id) {
+        uds.stop();
+      }
+    }
+
     if let Some(map) = WT_MAP.get() {
       if let Some(wt) = map.lock().unwrap().get(&py_id) {
         wt.stop();

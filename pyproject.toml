@@ -4,8 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "arnelify_server"
-authors = [{ name = "Arnelify" }]
-description = "Minimalistic dynamic library which is a powerful server written in C and C++."
+authors = [
+  { name = "Arnelify" },
+  { name = "Taron Sarkisyan" }
+]
+description = "Multi-language server with HTTP 3.0 and WebTransport support."
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [

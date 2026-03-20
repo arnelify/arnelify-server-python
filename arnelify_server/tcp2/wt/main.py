@@ -22,41 +22,56 @@
 
 from ... import arnelify_server as native
 
-from typing import Any, Callable, Dict, TypedDict
+from ...ipc.uds import UnixDomainSocket
+from ...ipc.uds import UnixDomainSocketBytes
+from ...ipc.uds import UnixDomainSocketCtx
+from ...ipc.uds import UnixDomainSocketOpts
+
+import asyncio
+from typing import Any, Awaitable, Callable, Dict, Optional, TypedDict, List
 import json
-import signal
-import sys
 
 class WebTransportStream:
-  id: int = 0
+  def __init__(self, id: int):
+    self.id: int = id
+    self.topic: str = ""
+    self.cb_send: Callable[[str, List[Any], bytes | bytearray], Awaitable[None]] = \
+      lambda _topic, _args, bytes_: print(bytes_)
 
-  def __init__(self, id):
-    self.id = id
+  async def close(self) -> Awaitable[None]:
+    args: List[Any] = [self.id]
+    await self.cb_send("wt_close", args, b"")
 
-  def close(self):
-    native.wt_close(self.id)
+  def on_send(self, cb: Callable[[str, List[Any], bytes], Awaitable[None]]) -> None:
+    self.cb_send = cb
 
-  def push(self, data: Dict[str, Any], bytes: bytes | bytearray):
-    native.wt_push(self.id, json.dumps(data, separators=(',', ':')), bytes)
+  async def push(self, payload: Any, bytes_: bytes | bytearray) -> Awaitable[None]:
+    args = [self.id, payload]
+    await self.cb_send("wt_push", args, bytes_)
 
-  def push_bytes(self, bytes: bytes | bytearray):
-    native.wt_push_bytes(self.id, bytes)
+  async def push_bytes(self, bytes_: bytes) -> Awaitable[None]:
+    args = [self.id]
+    await self.cb_send("wt_push_bytes", args, bytes_)
 
-  def push_json(self, data: Dict[str, Any]):
-    native.wt_push_json(self.id, json.dumps(data, separators=(',', ':')))
+  async def push_json(self, payload: Dict[str, Any]) -> Awaitable[None]:
+    args = [self.id, payload]
+    await self.cb_send("wt_push_json", args, b"")
 
-  def set_compression(self, compression: str | None):
-    native.wt_set_compression(self.id, "" if not compression else compression)
+  async def set_compression(self, compression: Optional[str]) -> Awaitable[None]:
+    args = [self.id, compression if compression else ""]
+    await self.cb_send("wt_set_compression", args, b"")
 
 type WebTransportBytes = bytes | bytearray
 type WebTransportCtx = Dict[str, Any]
-type WebTransportHandler = Callable[[WebTransportCtx, WebTransportBytes, WebTransportStream], None]
-type WebTransportLogger = Callable[[str, str], None]
+type WebTransportHandler = Callable[[WebTransportCtx, WebTransportBytes, WebTransportStream], Awaitable[None]]
+type WebTransportLogger = Callable[[str, str], Awaitable[None]]
 
 class WebTransportOpts(TypedDict, total=True):
   block_size_kb: int
+  cert_pem: str
   compression: bool
   handshake_timeout: int
+  key_pem: str
   max_message_size_kb: int
   ping_timeout: int
   port: int
@@ -64,31 +79,64 @@ class WebTransportOpts(TypedDict, total=True):
   thread_limit: int
 
 class WebTransport:
-  id: int = 0
-
-  def __init__(self, opts):
+  def __init__(self, opts: Dict[str, Any]):
+    self.id: int = 0
+    self.socket_path: str = "/var/run/arnelify_server.sock"
+    self.handlers: Dict[str, WebTransportHandler] = {}
+    self.uds: UnixDomainSocket
     self.opts = opts
-    self.id = native.wt_create(json.dumps(opts, separators=(',', ':')))
 
-  def logger(self, cb: WebTransportLogger):
-    native.wt_logger(self.id, cb)
+    uds_opts: UnixDomainSocketOpts = {
+      'block_size_kb': opts.get('block_size_kb'),
+      'socket_path': self.socket_path,
+      'thread_limit': opts.get('thread_limit')
+    }
 
-  def on(self, path: str, cb: WebTransportHandler):
-    def handler_adapter(stream_id: int, ctx: str, bytes: bytes | bytearray):
-      stream = WebTransportStream(stream_id)
-      cb(json.loads(ctx), bytes, stream)
+    self.uds = UnixDomainSocket(uds_opts)
+    self.id = native.wt_create(json.dumps({
+      "socket_path": self.socket_path,
+      **self.opts,
+    }, separators=(',', ':')))
 
-    native.wt_on(self.id, path, handler_adapter)
+  def logger(self, cb: WebTransportLogger) -> None:
+    async def logger_adapter(ctx: UnixDomainSocketCtx, bytes_: UnixDomainSocketBytes) -> Awaitable[None]:
+      level, message = ctx
+      await cb(level, message)
 
-  def start(self):
+    self.uds.on("wt_logger", logger_adapter)
+    native.wt_logger(self.id)
+
+  def on(self, path: str, cb: WebTransportHandler) -> None:
+    self.handlers[path] = cb
+
+    async def handler_adapter(ctx: List[Any], bytes_: bytes | bytearray) -> Awaitable[None]:
+      stream_id, handler_path, handler_ctx = ctx
+
+      stream: WebTransportStream = WebTransportStream(stream_id)
+      async def stream_handler(topic: str, args: List[Any], bytes_: bytes | bytearray) -> Awaitable[None]:
+        await self.uds.push(topic, args, bytes_)
+      stream.on_send(stream_handler)
+
+      handler = self.handlers.get(handler_path)
+      if handler:
+        await handler(handler_ctx, bytes_, stream)
+
+    self.uds.on("wt_on", handler_adapter)
+    native.wt_on(self.id, path)
+
+  async def start(self) -> Awaitable[None]:
+    native.wt_start_ipc(self.id)
+    await self.uds.start()
+    native.wt_start(self.id)
+
     try:
-      native.wt_start(self.id)
-      signal.pause()
-    except KeyboardInterrupt:
-      sys.exit(0)
+      await asyncio.Event().wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+      pass
   
-  def stop(self):
+  async def stop(self) -> Awaitable[None]:
     native.wt_stop(self.id)
+    await self.uds.stop()
   
   def __del__(self):
     native.wt_destroy(self.id)

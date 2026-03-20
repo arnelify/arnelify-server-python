@@ -22,44 +22,60 @@
 
 from ... import arnelify_server as native
 
-from typing import Any, Callable, Dict, TypedDict
+from ...ipc.uds import UnixDomainSocket
+from ...ipc.uds import UnixDomainSocketBytes
+from ...ipc.uds import UnixDomainSocketCtx
+from ...ipc.uds import UnixDomainSocketOpts
+
+import asyncio
+from typing import Any, Awaitable, Callable, Dict, Optional, TypedDict, List
 import json
-import signal
-import sys
 
 class Http1Stream:
-  id: int = 0
+  def __init__(self, id: int):
+    self.id: int = id
+    self.topic: str = ""
+    self.cb_send: Callable[[str, List[Any], bytes | bytearray], Awaitable[None]] = \
+      lambda _topic, _args, bytes_: print(bytes_)
 
-  def __init__(self, id):
-    self.id = id
+  async def add_header(self, key: str, value: str) -> Awaitable[None]:
+    args: List[Any] = [self.id, key, value]
+    await self.cb_send("http1_add_header", args, b"")
 
-  def add_header(self, key: str, value: str):
-    native.http1_add_header(self.id, key, value)
+  async def end(self) -> Awaitable[None]:
+    args: List[Any] = [self.id]
+    await self.cb_send("http1_end", args, b"")
+  
+  def on_send(self, cb: Callable[[str, List[Any], bytes | bytearray], Awaitable[None]]) -> None:
+    self.cb_send = cb
 
-  def end(self):
-    native.http1_end(self.id)
+  async def push_bytes(self, bytes_: bytes | bytearray, is_attachment: bool = False) -> Awaitable[None]:
+    args: List[Any] = [self.id, int(is_attachment)]
+    await self.cb_send("http1_push_bytes", args, bytes_)
 
-  def push_bytes(self, bytes: bytes | bytearray, is_attachment: bool = False):
-    native.http1_push_bytes(self.id, bytes, int(is_attachment))
+  async def push_file(self, file_path: str, is_attachment: bool = False) -> Awaitable[None]:
+    args: List[Any] = [self.id, file_path, int(is_attachment)]
+    await self.cb_send("http1_push_file", args, b"")
 
-  def push_file(self, file_path: str, is_attachment: bool = False):
-    native.http1_push_file(self.id, file_path, int(is_attachment))
+  async def push_json(self, payload: Any, is_attachment: bool = False) -> Awaitable[None]:
+    args: List[Any] = [self.id, payload, int(is_attachment)]
+    await self.cb_send("http1_push_json", args, b"")
 
-  def push_json(self, data: Dict[str, Any], is_attachment: bool = False):
-    native.http1_push_json(self.id, json.dumps(data, separators=(',', ':')), int(is_attachment))
+  async def set_code(self, code: int) -> Awaitable[None]:
+    args: List[Any] = [self.id, code]
+    await self.cb_send("http1_set_code", args, b""),
 
-  def set_code(self, code: int):
-    native.http1_set_code(self.id, code)
+  async def set_compression(self, compression: Optional[str]) -> Awaitable[None]:
+    args: List[Any] = [self.id, compression if compression else ""]
+    await self.cb_send("http1_set_compression", args, b"")
 
-  def set_compression(self, compression: str | None):
-    native.http1_set_compression(self.id, "" if not compression else compression)
-
-  def set_headers(self, headers: list[Dict[str, str]]):
-    native.http1_set_headers(self.id, json.dumps(headers, separators=(',', ':')))
+  async def set_headers(self, headers: List[Dict[str, str]]) -> Awaitable[None]:
+    args = [self.id, headers]
+    await self.cb_send("http1_set_headers", args, b"")
 
 type Http1Ctx = Dict[str, Any]
-type Http1Handler = Callable[[Http1Ctx, Http1Stream], None]
-type Http1Logger = Callable[[str, str], None]
+type Http1Handler = Callable[[Http1Ctx, Http1Stream], Awaitable[None]]
+type Http1Logger = Callable[[str, str], Awaitable[None]]
 
 class Http1Opts(TypedDict, total=True):
     allow_empty_files: bool
@@ -78,31 +94,64 @@ class Http1Opts(TypedDict, total=True):
     thread_limit: int
 
 class Http1:
-  id: int = 0
-
-  def __init__(self, opts):
+  def __init__(self, opts: Dict[str, Any]):
+    self.id: int = 0
+    self.socket_path: str = "/var/run/arnelify_server.sock"
+    self.handlers: Dict[str, Http1Handler] = {}
+    self.uds: UnixDomainSocket
     self.opts = opts
-    self.id = native.http1_create(json.dumps(opts, separators=(',', ':')))
 
-  def logger(self, cb: Http1Logger):
-    native.http1_logger(self.id, cb)
+    uds_opts: UnixDomainSocketOpts = {
+      'block_size_kb': opts.get('block_size_kb'),
+      'socket_path': self.socket_path,
+      'thread_limit': opts.get('thread_limit')
+    }
 
-  def on(self, path: str, cb: Http1Handler):
-    def handler_adapter(stream_id: int, ctx: str):
-      stream = Http1Stream(stream_id)
-      cb(json.loads(ctx), stream)
+    self.uds = UnixDomainSocket(uds_opts)
+    self.id = native.http1_create(json.dumps({
+      "socket_path": self.socket_path,
+      **self.opts,
+    }, separators=(',', ':')))
 
-    native.http1_on(self.id, path, handler_adapter)
+  def logger(self, cb: Http1Logger) -> None:
+    async def logger_adapter(ctx: UnixDomainSocketCtx, bytes_: UnixDomainSocketBytes) -> Awaitable[None]:
+      level, message = ctx
+      await cb(level, message)
 
-  def start(self):
+    self.uds.on("http1_logger", logger_adapter)
+    native.http1_logger(self.id)
+
+  def on(self, path: str, cb: Http1Handler) -> None:
+    self.handlers[path] = cb
+
+    async def handler_adapter(ctx: List[Any], bytes_: bytes | bytearray) -> Awaitable[None]:
+      stream_id, handler_path, handler_ctx = ctx
+
+      stream: Http1Stream = Http1Stream(stream_id)
+      async def stream_handler(topic: str, args: List[Any], bytes_: bytes | bytearray) -> Awaitable[None]:
+        await self.uds.push(topic, args, bytes_)
+      stream.on_send(stream_handler)
+
+      handler = self.handlers.get(handler_path)
+      if handler:
+        await handler(handler_ctx, stream)
+
+    self.uds.on("http1_on", handler_adapter)
+    native.http1_on(self.id, path)
+
+  async def start(self) -> Awaitable[None]:
+    native.http1_start_ipc(self.id)
+    await self.uds.start()
+    native.http1_start(self.id)
+
     try:
-      native.http1_start(self.id)
-      signal.pause()
-    except KeyboardInterrupt:
-      sys.exit(0)
+      await asyncio.Event().wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+      pass
   
-  def stop(self):
+  async def stop(self) -> Awaitable[None]:
     native.http1_stop(self.id)
+    await self.uds.stop()
   
   def __del__(self):
     native.http1_destroy(self.id)
