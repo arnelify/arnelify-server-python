@@ -12,10 +12,11 @@ async def main() -> Awaitable[None]:
   ws_opts: WebSocketOpts = {
     "block_size_kb": 64,
     "compression": True,
-    "handshake_timeout": 30,
     "max_message_size_kb": 64,
     "ping_timeout": 15,
     "port": 4433,
+    "rate_limit": 5,
+    "read_timeout": 30,
     "send_timeout": 30,
     "thread_limit": 4
   }

@@ -69,10 +69,11 @@ type WebSocketLogger = Callable[[str, str], Awaitable[None]]
 class WebSocketOpts(TypedDict, total=True):
   block_size_kb: int
   compression: bool
-  handshake_timeout: int
   max_message_size_kb: int
   ping_timeout: int
   port: int
+  rate_limit: int
+  read_timeout: int
   send_timeout: int
   thread_limit: int
 

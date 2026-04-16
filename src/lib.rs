@@ -32,7 +32,7 @@ mod arnelify_server {
 
   use crate::ipc::{
     UnixDomainSocket, UnixDomainSocketBytes, UnixDomainSocketCtx, UnixDomainSocketHandler,
-    UnixDomainSocketOpts,
+    UnixDomainSocketOpts, UnixDomainSocketStream
   };
 
   use crate::tcp1::{Http1, Http1Ctx, Http1Handler, Http1Logger, Http1Opts, Http1Stream};
@@ -77,10 +77,9 @@ mod arnelify_server {
   static HTTP2_STREAMS: OnceLock<Mutex<Http2Streams>> = OnceLock::new();
   static HTTP2_UDS_MAP: OnceLock<Mutex<HashMap<usize, Arc<UnixDomainSocket>>>> = OnceLock::new();
 
-  type WebSocketStreams = HashMap<usize, (Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)>;
+  type WebSocketStreams = HashMap<String, Arc<Mutex<WebSocketStream>>>;
   static WS_MAP: OnceLock<Mutex<HashMap<usize, Arc<WebSocket>>>> = OnceLock::new();
   static WS_ID: OnceLock<Mutex<usize>> = OnceLock::new();
-  static WS_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
   static WS_STREAMS: OnceLock<Mutex<WebSocketStreams>> = OnceLock::new();
   static WS_UDS_MAP: OnceLock<Mutex<HashMap<usize, Arc<UnixDomainSocket>>>> = OnceLock::new();
 
@@ -184,7 +183,8 @@ mod arnelify_server {
 
     let uds_http1_add_header: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -213,7 +213,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -227,7 +227,8 @@ mod arnelify_server {
 
     let uds_http1_end: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -252,7 +253,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -265,7 +266,8 @@ mod arnelify_server {
     );
 
     let uds_http1_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
-      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>| -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
@@ -293,7 +295,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -307,7 +309,8 @@ mod arnelify_server {
 
     let uds_http1_push_file: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -336,7 +339,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -350,7 +353,8 @@ mod arnelify_server {
 
     let uds_http1_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -379,7 +383,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -393,7 +397,8 @@ mod arnelify_server {
 
     let uds_http1_set_code: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -421,7 +426,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -435,7 +440,8 @@ mod arnelify_server {
 
     let uds_http1_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -468,7 +474,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -482,7 +488,8 @@ mod arnelify_server {
 
     let uds_http1_set_headers: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -522,7 +529,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP1_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http1_logger", &args, Vec::new(), true);
+                      uds.send("http1_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -534,7 +541,7 @@ mod arnelify_server {
       },
     );
 
-    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    let uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
     uds.on("http1_add_header", uds_http1_add_header);
     uds.on("http1_end", uds_http1_end);
     uds.on("http1_push_bytes", uds_http1_push_bytes);
@@ -598,7 +605,7 @@ mod arnelify_server {
 
       if let Some(map) = HTTP1_UDS_MAP.get() {
         if let Some(uds) = map.lock().unwrap().get(&py_id) {
-          uds.push("http1_logger", &args, bytes, true);
+          uds.send("http1_logger", &args, bytes, true);
         }
       }
     });
@@ -633,7 +640,7 @@ mod arnelify_server {
 
         if let Some(map) = HTTP1_UDS_MAP.get() {
           if let Some(uds) = map.lock().unwrap().get(&py_id) {
-            uds.push("http1_on", &args, bytes, true);
+            uds.send("http1_on", &args, bytes, true);
           }
         }
 
@@ -649,7 +656,7 @@ mod arnelify_server {
                 serde_json::json!(["error", "PYO3 error in http1_on: Stream response timeout."]);
               if let Some(map) = HTTP1_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("http1_logger", &args, Vec::new(), true);
+                  uds.send("http1_logger", &args, Vec::new(), true);
                 }
               }
               break;
@@ -661,7 +668,7 @@ mod arnelify_server {
               ]);
               if let Some(map) = HTTP1_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("http1_logger", &args, Vec::new(), true);
+                  uds.send("http1_logger", &args, Vec::new(), true);
                 }
               }
 
@@ -771,7 +778,8 @@ mod arnelify_server {
 
     let uds_http2_add_header: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -800,7 +808,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -814,7 +822,8 @@ mod arnelify_server {
 
     let uds_http2_end: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -839,7 +848,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -852,7 +861,8 @@ mod arnelify_server {
     );
 
     let uds_http2_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
-      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>| -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
@@ -880,7 +890,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -894,7 +904,8 @@ mod arnelify_server {
 
     let uds_http2_push_file: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -923,7 +934,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -937,7 +948,8 @@ mod arnelify_server {
 
     let uds_http2_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -966,7 +978,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -980,7 +992,8 @@ mod arnelify_server {
 
     let uds_http2_set_code: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -1008,7 +1021,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1022,7 +1035,8 @@ mod arnelify_server {
 
     let uds_http2_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -1055,7 +1069,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1069,7 +1083,8 @@ mod arnelify_server {
 
     let uds_http2_set_headers: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -1110,7 +1125,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP2_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http2_logger", &args, Vec::new(), true);
+                      uds.send("http2_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1122,7 +1137,7 @@ mod arnelify_server {
       },
     );
 
-    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    let uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
     uds.on("http2_add_header", uds_http2_add_header);
     uds.on("http2_end", uds_http2_end);
     uds.on("http2_push_bytes", uds_http2_push_bytes);
@@ -1188,7 +1203,7 @@ mod arnelify_server {
 
       if let Some(map) = HTTP2_UDS_MAP.get() {
         if let Some(uds) = map.lock().unwrap().get(&py_id) {
-          uds.push("http2_logger", &args, bytes, true);
+          uds.send("http2_logger", &args, bytes, true);
         }
       }
     });
@@ -1222,7 +1237,7 @@ mod arnelify_server {
 
         if let Some(map) = HTTP2_UDS_MAP.get() {
           if let Some(uds) = map.lock().unwrap().get(&py_id) {
-            uds.push("http2_on", &args, bytes, true);
+            uds.send("http2_on", &args, bytes, true);
           }
         }
 
@@ -1238,7 +1253,7 @@ mod arnelify_server {
                 serde_json::json!(["error", "PYO3 error in http2_on: Stream response timeout."]);
               if let Some(map) = HTTP2_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("http2_logger", &args, Vec::new(), true);
+                  uds.send("http2_logger", &args, Vec::new(), true);
                 }
               }
               break;
@@ -1250,7 +1265,7 @@ mod arnelify_server {
               ]);
               if let Some(map) = HTTP2_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("http2_logger", &args, Vec::new(), true);
+                  uds.send("http2_logger", &args, Vec::new(), true);
                 }
               }
 
@@ -1358,24 +1373,26 @@ mod arnelify_server {
 
     let uds_ws_close: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
           Some(v) => {
-            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let addr: &str = v[0].as_str().unwrap_or("");
+
             if let Some(map) = WS_STREAMS.get() {
-              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+              let ws_stream: Option<Arc<Mutex<WebSocketStream>>> = {
                 let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-                streams.get(&stream_id).cloned()
+                streams.get(addr).cloned()
               };
 
-              match stream {
-                Some((stream_arc, tx)) => {
-                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+              match ws_stream {
+                Some(ws_stream_safe) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> =
+                    ws_stream_safe.lock().unwrap();
                   stream_lock.close();
-                  let _ = tx.send(1);
                 }
                 None => {
                   let args: JSON =
@@ -1383,7 +1400,7 @@ mod arnelify_server {
 
                   if let Some(map) = WS_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("ws_logger", &args, Vec::new(), true);
+                      uds.send("ws_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1396,24 +1413,26 @@ mod arnelify_server {
     );
 
     let uds_ws_push: Arc<UnixDomainSocketHandler> = Arc::new(
-      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>| -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
           Some(v) => {
-            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let addr: &str = v[0].as_str().unwrap_or("");
             let json: JSON = v[1].clone();
             let bytes: Vec<u8> = bytes.lock().unwrap().clone();
 
             if let Some(map) = WS_STREAMS.get() {
-              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+              let ws_stream: Option<Arc<Mutex<WebSocketStream>>> = {
                 let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-                streams.get(&stream_id).cloned()
+                streams.get(addr).cloned()
               };
 
-              match stream {
-                Some((stream_arc, _tx)) => {
-                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+              match ws_stream {
+                Some(ws_stream_safe) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> =
+                    ws_stream_safe.lock().unwrap();
                   stream_lock.push(&json, &bytes);
                 }
                 None => {
@@ -1422,7 +1441,7 @@ mod arnelify_server {
 
                   if let Some(map) = WS_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("ws_logger", &args, Vec::new(), true);
+                      uds.send("ws_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1435,23 +1454,25 @@ mod arnelify_server {
     );
 
     let uds_ws_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
-      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>| -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
           Some(v) => {
-            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let addr: &str = v[0].as_str().unwrap_or("");
             let bytes: Vec<u8> = bytes.lock().unwrap().clone();
 
             if let Some(map) = WS_STREAMS.get() {
-              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+              let ws_stream: Option<Arc<Mutex<WebSocketStream>>> = {
                 let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-                streams.get(&stream_id).cloned()
+                streams.get(addr).cloned()
               };
 
-              match stream {
-                Some((stream_arc, _tx)) => {
-                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+              match ws_stream {
+                Some(ws_stream_safe) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> =
+                    ws_stream_safe.lock().unwrap();
                   stream_lock.push_bytes(&bytes);
                 }
                 None => {
@@ -1462,7 +1483,7 @@ mod arnelify_server {
 
                   if let Some(map) = WS_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("ws_logger", &args, Vec::new(), true);
+                      uds.send("ws_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1476,24 +1497,26 @@ mod arnelify_server {
 
     let uds_ws_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
           Some(v) => {
-            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let addr: &str = v[0].as_str().unwrap_or("");
             let json: JSON = v[1].clone();
 
             if let Some(map) = WS_STREAMS.get() {
-              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+              let ws_stream: Option<Arc<Mutex<WebSocketStream>>> = {
                 let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-                streams.get(&stream_id).cloned()
+                streams.get(addr).cloned()
               };
 
-              match stream {
-                Some((stream_arc, _tx)) => {
-                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+              match ws_stream {
+                Some(ws_stream_safe) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> =
+                    ws_stream_safe.lock().unwrap();
                   stream_lock.push_json(&json);
                 }
                 None => {
@@ -1504,7 +1527,7 @@ mod arnelify_server {
 
                   if let Some(map) = WS_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("ws_logger", &args, Vec::new(), true);
+                      uds.send("ws_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1518,24 +1541,26 @@ mod arnelify_server {
 
     let uds_ws_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
           Some(v) => {
-            let stream_id: usize = v[0].as_u64().unwrap_or(0) as usize;
+            let addr: &str = v[0].as_str().unwrap_or("");
             let compression: &str = v[1].as_str().unwrap_or("");
 
             if let Some(map) = WS_STREAMS.get() {
-              let stream: Option<(Arc<Mutex<WebSocketStream>>, mpsc::Sender<u8>)> = {
+              let ws_stream: Option<Arc<Mutex<WebSocketStream>>> = {
                 let streams: MutexGuard<'_, WebSocketStreams> = map.lock().unwrap();
-                streams.get(&stream_id).cloned()
+                streams.get(addr).cloned()
               };
 
-              match stream {
-                Some((stream_arc, _tx)) => {
-                  let mut stream_lock: MutexGuard<'_, WebSocketStream> = stream_arc.lock().unwrap();
+              match ws_stream {
+                Some(ws_stream_safe) => {
+                  let mut stream_lock: MutexGuard<'_, WebSocketStream> =
+                    ws_stream_safe.lock().unwrap();
                   if compression.len() > 0 {
                     stream_lock.set_compression(Some(String::from(compression)));
                     return;
@@ -1551,7 +1576,7 @@ mod arnelify_server {
 
                   if let Some(map) = WS_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("ws_logger", &args, Vec::new(), true);
+                      uds.send("ws_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1563,7 +1588,7 @@ mod arnelify_server {
       },
     );
 
-    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    let uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
     uds.on("ws_close", uds_ws_close);
     uds.on("ws_push", uds_ws_push);
     uds.on("ws_push_bytes", uds_ws_push_bytes);
@@ -1579,15 +1604,33 @@ mod arnelify_server {
     let ws_opts: WebSocketOpts = WebSocketOpts {
       block_size_kb: get_usize(&opts, "block_size_kb"),
       compression: get_bool(&opts, "compression"),
-      handshake_timeout: get_u64(&opts, "handshake_timeout"),
       max_message_size_kb: get_u64(&opts, "max_message_size_kb"),
       ping_timeout: get_u64(&opts, "ping_timeout"),
       port: get_u16(&opts, "port"),
+      rate_limit: get_u64(&opts, "rate_limit"),
+      read_timeout: get_u64(&opts, "read_timeout"),
       send_timeout: get_u64(&opts, "send_timeout"),
       thread_limit: get_u64(&opts, "thread_limit"),
     };
 
     let ws: WebSocket = WebSocket::new(ws_opts);
+
+    ws.on(
+      "_disconnect",
+      Arc::new(
+        |ctx: Arc<Mutex<WebSocketCtx>>,
+         _bytes: Arc<Mutex<WebSocketBytes>>,
+         _stream: Arc<Mutex<WebSocketStream>>| {
+          let ctx: WebSocketCtx = ctx.lock().unwrap().clone();
+          if let Some(addr) = ctx["_state"]["addr"].as_str() {
+            if let Some(map) = WS_STREAMS.get() {
+              map.lock().unwrap().remove(addr);
+            }
+          }
+        },
+      ),
+    );
+
     let ws_map: &Mutex<HashMap<usize, Arc<WebSocket>>> =
       WS_MAP.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -1618,7 +1661,7 @@ mod arnelify_server {
 
       if let Some(map) = WS_UDS_MAP.get() {
         if let Some(uds) = map.lock().unwrap().get(&py_id) {
-          uds.push("ws_logger", &args, bytes, true);
+          uds.send("ws_logger", &args, bytes, true);
         }
       }
     });
@@ -1640,58 +1683,30 @@ mod arnelify_server {
             bytes: Arc<Mutex<WebSocketBytes>>,
             stream: Arc<Mutex<WebSocketStream>>|
             -> () {
-        let (tx, rx) = mpsc::channel::<u8>();
-        let stream_id: usize = WS_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-
-        WS_STREAMS
-          .get_or_init(|| Mutex::new(HashMap::new()))
-          .lock()
-          .unwrap()
-          .insert(stream_id, (stream, tx));
-
         let ctx: WebSocketCtx = ctx.lock().unwrap().clone();
-        let args: JSON = serde_json::json!([stream_id, topic_safe, ctx]);
-        let bytes: WebSocketBytes = bytes.lock().unwrap().clone();
+        if let Some(addr) = ctx["_state"]["addr"].as_str() {
+          if topic_safe == "_disconnect" {
+            if let Some(map) = WS_STREAMS.get() {
+              map.lock().unwrap().remove(addr);
+            }
 
-        if let Some(map) = WS_UDS_MAP.get() {
-          if let Some(uds) = map.lock().unwrap().get(&py_id) {
-            uds.push("ws_on", &args, bytes, true);
+            return;
           }
-        }
 
-        loop {
-          match rx.recv_timeout(Duration::from_secs(90)) {
-            Ok(val) => {
-              if val == 1 {
-                break;
-              }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-              let args: JSON =
-                serde_json::json!(["error", "PYO3 error in ws_on: Stream response timeout."]);
-              if let Some(map) = WS_UDS_MAP.get() {
-                if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("ws_logger", &args, Vec::new(), true);
-                }
-              }
-              break;
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-              let args: JSON =
-                serde_json::json!(["error", "PYO3 error in ws_on: Stream channel disconnected."]);
-              if let Some(map) = WS_UDS_MAP.get() {
-                if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("ws_logger", &args, Vec::new(), true);
-                }
-              }
+          WS_STREAMS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .insert(String::from(addr), stream);
 
-              break;
+          let args: JSON = serde_json::json!([addr, topic_safe, ctx]);
+          let bytes: WebSocketBytes = bytes.lock().unwrap().clone();
+
+          if let Some(map) = WS_UDS_MAP.get() {
+            if let Some(uds) = map.lock().unwrap().get(&py_id) {
+              uds.send("ws_on", &args, bytes, true);
             }
           }
-        }
-
-        if let Some(map) = WS_STREAMS.get() {
-          map.lock().unwrap().remove(&stream_id);
         }
       },
     );
@@ -1791,7 +1806,8 @@ mod arnelify_server {
 
     let uds_http3_add_header: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -1820,7 +1836,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1834,7 +1850,8 @@ mod arnelify_server {
 
     let uds_http3_end: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -1859,7 +1876,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1872,7 +1889,8 @@ mod arnelify_server {
     );
 
     let uds_http3_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
-      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>| -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
@@ -1900,7 +1918,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1914,7 +1932,8 @@ mod arnelify_server {
 
     let uds_http3_push_file: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -1943,7 +1962,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -1957,7 +1976,8 @@ mod arnelify_server {
 
     let uds_http3_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -1986,7 +2006,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2000,7 +2020,8 @@ mod arnelify_server {
 
     let uds_http3_set_code: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -2028,7 +2049,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2042,7 +2063,8 @@ mod arnelify_server {
 
     let uds_http3_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -2075,7 +2097,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2089,7 +2111,8 @@ mod arnelify_server {
 
     let uds_http3_set_headers: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -2130,7 +2153,7 @@ mod arnelify_server {
 
                   if let Some(map) = HTTP3_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("http3_logger", &args, Vec::new(), true);
+                      uds.send("http3_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2142,7 +2165,7 @@ mod arnelify_server {
       },
     );
 
-    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    let uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
     uds.on("http3_add_header", uds_http3_add_header);
     uds.on("http3_end", uds_http3_end);
     uds.on("http3_push_bytes", uds_http3_push_bytes);
@@ -2208,7 +2231,7 @@ mod arnelify_server {
 
       if let Some(map) = HTTP3_UDS_MAP.get() {
         if let Some(uds) = map.lock().unwrap().get(&py_id) {
-          uds.push("http3_logger", &args, bytes, true);
+          uds.send("http3_logger", &args, bytes, true);
         }
       }
     });
@@ -2242,7 +2265,7 @@ mod arnelify_server {
 
         if let Some(map) = HTTP3_UDS_MAP.get() {
           if let Some(uds) = map.lock().unwrap().get(&py_id) {
-            uds.push("http3_on", &args, bytes, true);
+            uds.send("http3_on", &args, bytes, true);
           }
         }
 
@@ -2258,7 +2281,7 @@ mod arnelify_server {
                 serde_json::json!(["error", "PYO3 error in http3_on: Stream response timeout."]);
               if let Some(map) = HTTP3_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("http3_logger", &args, Vec::new(), true);
+                  uds.send("http3_logger", &args, Vec::new(), true);
                 }
               }
               break;
@@ -2270,7 +2293,7 @@ mod arnelify_server {
               ]);
               if let Some(map) = HTTP3_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("http3_logger", &args, Vec::new(), true);
+                  uds.send("http3_logger", &args, Vec::new(), true);
                 }
               }
 
@@ -2378,7 +2401,8 @@ mod arnelify_server {
 
     let uds_wt_close: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -2405,7 +2429,7 @@ mod arnelify_server {
 
                   if let Some(map) = WT_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("wt_logger", &args, Vec::new(), true);
+                      uds.send("wt_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2418,7 +2442,8 @@ mod arnelify_server {
     );
 
     let uds_wt_push: Arc<UnixDomainSocketHandler> = Arc::new(
-      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>| -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
@@ -2445,7 +2470,7 @@ mod arnelify_server {
 
                   if let Some(map) = WT_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("wt_logger", &args, Vec::new(), true);
+                      uds.send("wt_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2458,7 +2483,8 @@ mod arnelify_server {
     );
 
     let uds_wt_push_bytes: Arc<UnixDomainSocketHandler> = Arc::new(
-      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>| -> () {
+      move |ctx: Arc<Mutex<UnixDomainSocketCtx>>, bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>| -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
         match args.as_array() {
@@ -2485,7 +2511,7 @@ mod arnelify_server {
 
                   if let Some(map) = WT_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("wt_logger", &args, Vec::new(), true);
+                      uds.send("wt_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2499,7 +2525,8 @@ mod arnelify_server {
 
     let uds_wt_push_json: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -2528,7 +2555,7 @@ mod arnelify_server {
 
                   if let Some(map) = WT_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("wt_logger", &args, Vec::new(), true);
+                      uds.send("wt_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2542,7 +2569,8 @@ mod arnelify_server {
 
     let uds_wt_set_compression: Arc<UnixDomainSocketHandler> = Arc::new(
       move |ctx: Arc<Mutex<UnixDomainSocketCtx>>,
-            _bytes: Arc<Mutex<UnixDomainSocketBytes>>|
+            _bytes: Arc<Mutex<UnixDomainSocketBytes>>,
+          _stream: Arc<Mutex<UnixDomainSocketStream>>|
             -> () {
         let args: JSON = ctx.lock().unwrap().clone();
 
@@ -2576,7 +2604,7 @@ mod arnelify_server {
 
                   if let Some(map) = WT_UDS_MAP.get() {
                     if let Some(uds) = map.lock().unwrap().get(&new_id) {
-                      uds.push("wt_logger", &args, Vec::new(), true);
+                      uds.send("wt_logger", &args, Vec::new(), true);
                     }
                   }
                 }
@@ -2588,7 +2616,7 @@ mod arnelify_server {
       },
     );
 
-    let mut uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
+    let uds: UnixDomainSocket = UnixDomainSocket::new(uds_opts);
     uds.on("wt_close", uds_wt_close);
     uds.on("wt_push", uds_wt_push);
     uds.on("wt_push_bytes", uds_wt_push_bytes);
@@ -2641,7 +2669,7 @@ mod arnelify_server {
 
       if let Some(map) = WT_UDS_MAP.get() {
         if let Some(uds) = map.lock().unwrap().get(&py_id) {
-          uds.push("wt_logger", &args, bytes, true);
+          uds.send("wt_logger", &args, bytes, true);
         }
       }
     });
@@ -2678,7 +2706,7 @@ mod arnelify_server {
 
         if let Some(map) = WT_UDS_MAP.get() {
           if let Some(uds) = map.lock().unwrap().get(&py_id) {
-            uds.push("wt_on", &args, bytes, true);
+            uds.send("wt_on", &args, bytes, true);
           }
         }
 
@@ -2694,7 +2722,7 @@ mod arnelify_server {
                 serde_json::json!(["error", "PYO3 error in wt_on: Stream response timeout."]);
               if let Some(map) = WT_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("wt_logger", &args, Vec::new(), true);
+                  uds.send("wt_logger", &args, Vec::new(), true);
                 }
               }
               break;
@@ -2704,7 +2732,7 @@ mod arnelify_server {
                 serde_json::json!(["error", "PYO3 error in wt_on: Stream channel disconnected."]);
               if let Some(map) = WT_UDS_MAP.get() {
                 if let Some(uds) = map.lock().unwrap().get(&py_id) {
-                  uds.push("wt_logger", &args, Vec::new(), true);
+                  uds.send("wt_logger", &args, Vec::new(), true);
                 }
               }
 
